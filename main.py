@@ -1495,7 +1495,7 @@ async def get_occurrence(
         raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
 
 
-@app.get("/api/families", response_model=PaginatedResponse)
+@app.get("/families", response_model=PaginatedResponse)
 async def get_families(
         params: TaxonomyFilterParams = Depends(),
         db: Session = Depends(get_db)
@@ -1590,7 +1590,7 @@ async def get_families(
     )
 
 
-@app.get("/api/families/{family_name}")
+@app.get("/families/{family_name}")
 async def get_family_detail(family_name: str, db: Session = Depends(get_db)):
     """Get family details"""
     query = text("""
@@ -1622,7 +1622,7 @@ async def get_family_detail(family_name: str, db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/genera", response_model=PaginatedResponse)
+@app.get("/genera", response_model=PaginatedResponse)
 async def get_genera(
         params: TaxonomyFilterParams = Depends(),
         db: Session = Depends(get_db)
@@ -1708,7 +1708,7 @@ async def get_genera(
     )
 
 
-@app.get("/api/genera/{genus_name}")
+@app.get("/genera/{genus_name}")
 async def get_genus_detail(genus_name: str, db: Session = Depends(get_db)):
     """Get genus details"""
     query = text("""
@@ -1740,7 +1740,7 @@ async def get_genus_detail(genus_name: str, db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/species", response_model=PaginatedResponse)
+@app.get("/species", response_model=PaginatedResponse)
 async def get_species(
         params: TaxonomyFilterParams = Depends(),
         db: Session = Depends(get_db)
@@ -1848,7 +1848,7 @@ async def get_species(
         pages=(total + params.per_page - 1) // params.per_page
     )
 
-@app.get("/api/species/{scientific_name}")
+@app.get("/species/{scientific_name}")
 async def get_species_detail(scientific_name: str, db: Session = Depends(get_db)):
     """Get species details - using real-time calculation to ensure data consistency"""
     
@@ -1922,7 +1922,7 @@ async def get_species_detail(scientific_name: str, db: Session = Depends(get_db)
     }
 
 
-@app.get("/api/institutions", response_model=PaginatedResponse)
+@app.get("/institutions", response_model=PaginatedResponse)
 async def get_institutions(
         params: InstitutionFilterParams = Depends(),
         db: Session = Depends(get_db)
@@ -2024,7 +2024,7 @@ async def get_institutions(
         pages=(total + params.per_page - 1) // params.per_page
     )
 
-@app.get("/api/institutions/{institution_code}")
+@app.get("/institutions/{institution_code}")
 async def get_institution_detail(institution_code: str, db: Session = Depends(get_db)):
     """Get institution details"""
     query = text("""
@@ -2062,7 +2062,7 @@ async def get_institution_detail(institution_code: str, db: Session = Depends(ge
     }
 
 
-@app.get("/api/records", response_model=PaginatedResponse)
+@app.get("/records", response_model=PaginatedResponse)
 async def get_records(
         params: RecordFilterParams = Depends(),
         db: Session = Depends(get_db)
@@ -2167,7 +2167,7 @@ async def get_records(
     )
 
 
-@app.get("/api/taxonomy/stats")
+@app.get("/taxonomy/stats")
 async def get_taxonomy_stats(db: Session = Depends(get_db)):
     """Get taxonomy statistics - includes dynamically calculated metrics"""
 
@@ -2358,7 +2358,7 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
 
 # Institution records endpoints
 
-@app.get("/api/institutions/{institution_code}/records", response_model=PaginatedResponse)
+@app.get("/institutions/{institution_code}/records", response_model=PaginatedResponse)
 async def get_institution_records(
         institution_code: str,
         page: int = Query(1, ge=1),
@@ -2472,7 +2472,7 @@ async def get_institution_records(
     )
 
 
-@app.get("/api/institutions/{institution_code}/records/summary")
+@app.get("/institutions/{institution_code}/records/summary")
 async def get_institution_records_summary(
         institution_code: str,
         db: Session = Depends(get_db)
@@ -2526,7 +2526,7 @@ async def get_institution_records_summary(
     }
 
 
-@app.get("/api/institutions/{institution_code}/records/filters")
+@app.get("/institutions/{institution_code}/records/filters")
 async def get_institution_records_filters(
         institution_code: str,
         db: Session = Depends(get_db)
@@ -2600,7 +2600,7 @@ async def get_institution_records_filters(
     }
 
 
-@app.get("/api/institutions/{institution_code}/records/export")
+@app.get("/institutions/{institution_code}/records/export")
 async def export_institution_records(
         institution_code: str,
         format: str = Query("csv", regex="^(csv|json|dwc)$"),
@@ -2780,7 +2780,7 @@ async def export_institution_records(
 
 
 # RecordsTable component API
-@app.get("/api/records/by-institution/{institution_code}")
+@app.get("/records/by-institution/{institution_code}")
 async def get_records_by_institution(
         institution_code: str,
         page: int = Query(1, ge=1),
@@ -2842,7 +2842,7 @@ async def get_records_by_institution(
 
 # Geo-coordinate filter parameters for get_records_by_institution_v2
 
-@app.get("/api/records/institution/{institution_code}", response_model=PaginatedResponse)
+@app.get("/records/institution/{institution_code}", response_model=PaginatedResponse)
 async def get_records_by_institution_v2(
         institution_code: str,
         page: int = Query(1, ge=1),
@@ -2961,7 +2961,7 @@ async def get_records_by_institution_v2(
         pages=(total + per_page - 1) // per_page
     )
 
-@app.get("/api/institution/stats")
+@app.get("/institution/stats")
 async def get_institutions_stats(db: Session = Depends(get_db)):
     """Get institution statistics - fixed version"""
 
@@ -3071,7 +3071,7 @@ async def get_institutions_stats(db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/institutions/{institution_code}/countries")
+@app.get("/institutions/{institution_code}/countries")
 async def get_institution_countries(institution_code: str, db: Session = Depends(get_db)):
     """Get institution distribution by country"""
     query = text("""
@@ -3095,7 +3095,7 @@ async def get_institution_countries(institution_code: str, db: Session = Depends
     return {"countries": countries}
 
 
-@app.get("/api/orders")
+@app.get("/orders")
 async def get_orders(db: Session = Depends(get_db)):
     """Get all orders"""
     query = text("""
@@ -3119,7 +3119,7 @@ async def get_orders(db: Session = Depends(get_db)):
     ]
 
 
-@app.get("/api/records/taxon/{taxon_type}/{taxon_name}")
+@app.get("/records/taxon/{taxon_type}/{taxon_name}")
 async def get_records_by_taxon(
         taxon_type: str,
         taxon_name: str,
@@ -3201,7 +3201,7 @@ async def get_records_by_taxon(
 
 # Taxonomy hierarchy endpoints
 
-@app.get("/api/families/{family_name}/children")
+@app.get("/families/{family_name}/children")
 async def get_family_children(
         family_name: str,
         page: int = Query(1, ge=1),
@@ -3282,7 +3282,7 @@ async def get_family_children(
     )
 
 
-@app.get("/api/genera/{genus_name}/children")
+@app.get("/genera/{genus_name}/children")
 async def get_genus_children(
         genus_name: str,
         page: int = Query(1, ge=1),
@@ -3359,7 +3359,7 @@ async def get_genus_children(
     )
 
 
-@app.get("/api/{taxon_type}/{taxon_name}/diversity")
+@app.get("/{taxon_type}/{taxon_name}/diversity")
 async def get_taxon_diversity(
         taxon_type: str,
         taxon_name: str,
@@ -3416,7 +3416,7 @@ async def get_taxon_diversity(
     return {"diversityData": diversity_data}
 
 
-@app.get("/api/{taxon_type}/{taxon_name}/geographic")
+@app.get("/{taxon_type}/{taxon_name}/geographic")
 async def get_taxon_geographic_distribution(
         taxon_type: str,
         taxon_name: str,
@@ -3530,7 +3530,7 @@ async def get_taxon_geographic_distribution(
 
 # Fix SQL syntax error in temporal patterns query
 
-@app.get("/api/{taxon_type}/{taxon_name}/temporal")
+@app.get("/{taxon_type}/{taxon_name}/temporal")
 async def get_taxon_temporal_patterns(
         taxon_type: str,
         taxon_name: str,
@@ -3748,7 +3748,7 @@ async def get_taxon_temporal_patterns(
 
 
 # 3. Institution API modification - ensure map-required data is returned
-@app.get("/api/{taxon_type}/{taxon_name}/institutions")
+@app.get("/{taxon_type}/{taxon_name}/institutions")
 async def get_taxon_institutions(
         taxon_type: str,
         taxon_name: str,
@@ -3855,7 +3855,7 @@ async def get_taxon_institutions(
 
 
 # 4. Map data endpoint
-@app.get("/api/{taxon_type}/{taxon_name}/map-data")
+@app.get("/{taxon_type}/{taxon_name}/map-data")
 async def get_taxon_map_data(
         taxon_type: str,
         taxon_name: str,
@@ -3968,7 +3968,7 @@ async def get_taxon_map_data(
     return {"mapData": map_data}
 
 
-@app.get("/api/{taxon_type}/{taxon_name}/top-species")
+@app.get("/{taxon_type}/{taxon_name}/top-species")
 async def get_taxon_top_species(
         taxon_type: str,
         taxon_name: str,
@@ -4010,7 +4010,7 @@ async def get_taxon_top_species(
     return {"topSpecies": top_species}
 
 
-@app.get("/api/taxonomy/hierarchy/{taxon_type}/{taxon_name}")
+@app.get("/taxonomy/hierarchy/{taxon_type}/{taxon_name}")
 async def get_taxon_hierarchy(
         taxon_type: str,
         taxon_name: str,
@@ -4057,7 +4057,7 @@ async def get_taxon_hierarchy(
 
 # Taxonomy hierarchy endpoints
 
-@app.get("/api/{taxon_type}/{taxon_name}/institution-coverage")
+@app.get("/{taxon_type}/{taxon_name}/institution-coverage")
 async def get_taxon_institution_coverage(
         taxon_type: str,
         taxon_name: str,
