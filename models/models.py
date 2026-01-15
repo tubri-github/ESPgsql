@@ -9,27 +9,27 @@ from datetime import datetime
 Base = declarative_base()
 
 
-# SQLAlchemy模型
+# SQLAlchemy models
 class HarvestedRecord(Base):
     __tablename__ = "harvestedfn2"
     __table_args__ = {"schema": "dbo"}
 
-    # 使用catalognumber作为主键，如果没有则需要添加ID字段
+    # Use catalognumber as primary key, add ID field if not present
     catalognumber = Column(Integer, primary_key=True)
 
-    # Darwin Core字段
+    # Darwin Core fields
     scientificname = Column(String)
     genus = Column(String)
     specificepithet = Column(String)
     infraspecificepithet = Column(String)
     scientificnameauthorship = Column(String)
     family = Column(String)
-    order = Column(String, name="order")  # order是SQL关键字
-    class_ = Column(String, name="class")  # class是Python关键字
+    order = Column(String, name="order")  # order is a SQL keyword
+    class_ = Column(String, name="class")  # class is a Python keyword
     phylum = Column(String)
     kingdom = Column(String)
 
-    # 分类状态
+    # Taxonomic status
     taxonrank = Column(String)
     taxonomicstatus = Column(String)
     acceptednameusage = Column(String)
@@ -38,7 +38,7 @@ class HarvestedRecord(Base):
     vernacularname = Column(String)
     nomenclaturalcode = Column(String)
 
-    # 记录信息
+    # Record information
     basisofrecord = Column(String)
     occurrenceid = Column(String)
     recordnumber = Column(String)
@@ -50,13 +50,13 @@ class HarvestedRecord(Base):
     lifestage = Column(String)
     reproductivecondition = Column(String)
 
-    # 事件信息
+    # Event information
     eventdate = Column(String)
     year = Column(Integer)
     month = Column(Integer)
     day = Column(Integer)
 
-    # 地理信息
+    # Geographic information
     continent = Column(String)
     country = Column(String)
     countrycode = Column(String)
@@ -68,13 +68,13 @@ class HarvestedRecord(Base):
     island = Column(String)
     islandgroup = Column(String)
 
-    # 坐标信息
+    # Coordinate information
     decimallatitude = Column(Float)
     decimallongitude = Column(Float)
     coordinateuncertaintyinmeters = Column(Float)
     coordinateprecision = Column(Float)
 
-    # 海拔深度
+    # Elevation and depth
     minimumelevationinmeters = Column(String)
     maximumelevationinmeters = Column(String)
     verbatimelevation = Column(String)
@@ -82,19 +82,19 @@ class HarvestedRecord(Base):
     maximumdepthinmeters = Column(String)
     verbatimdepth = Column(String)
 
-    # 地理参考
+    # Georeference
     georeferenceddate = Column(String)
     georeferenceprotocol = Column(String)
     georeferenceremarks = Column(String)
     georeferenceverificationstatus = Column(String)
 
-    # 鉴定信息
+    # Identification information
     identifiedby = Column(String)
     dateidentified = Column(String)
     identificationqualifier = Column(String)
     identificationremarks = Column(String)
 
-    # 机构信息
+    # Institution information
     institutioncode = Column(String)
     institutionid = Column(String)
     ownerinstitutioncode = Column(String)
@@ -102,7 +102,7 @@ class HarvestedRecord(Base):
     collectionid = Column(String)
     datasetname = Column(String)
 
-    # 其他字段
+    # Other fields
     occurrencestatus = Column(String)
     establishmentmeans = Column(String)
     occurrenceremarks = Column(String)
@@ -110,9 +110,9 @@ class HarvestedRecord(Base):
     associatedmedia = Column(String)
     preparations = Column(String)
     samplingprotocol = Column(String)
-    references = Column(String, name="references")  # references是Python关键字
+    references = Column(String, name="references")  # references is a Python keyword
 
-    # 数据管理
+    # Data management
     modified = Column(String)
     informationwithheld = Column(String)
     datageneralizations = Column(String)
@@ -120,7 +120,7 @@ class HarvestedRecord(Base):
     processing_date = Column(String)
 
 
-# Pydantic模型用于API响应
+# Pydantic models for API responses
 class TaxonBase(BaseModel):
     scientificname: Optional[str] = None
     vernacularname: Optional[str] = None
@@ -178,11 +178,11 @@ class SpeciesResponse(TaxonBase):
 
 class InstitutionResponse(BaseModel):
     institution_code: str = Field(alias="institutioncode")
-    institution_name: Optional[str] = None  # 需要从其他表获取或映射
+    institution_name: Optional[str] = None  # Needs to be fetched from another table or mapped
     owner_institution_code: Optional[str] = Field(None, alias="ownerinstitutioncode")
     country: Optional[str] = None
-    region: Optional[str] = None  # 需要映射
-    institution_type: Optional[str] = None  # 需要映射
+    region: Optional[str] = None  # Needs mapping
+    institution_type: Optional[str] = None  # Needs mapping
     record_count: int = 0
     species_count: int = 0
     families_count: int = 0
@@ -251,7 +251,7 @@ class PaginatedResponse(BaseModel):
     pages: int
 
 
-# 查询参数模型
+# Query parameter models
 class PaginationParams(BaseModel):
     page: int = Field(1, ge=1)
     per_page: int = Field(50, ge=1, le=200)

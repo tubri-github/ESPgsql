@@ -5,12 +5,85 @@ import math
 from fastapi import FastAPI, Query, HTTPException, Depends
 
 
-# ============== 地理空间工具函数 ==============
+# ============== Wildcard Search Support ==============
+
+def has_wildcard(term: str) -> bool:
+    """Check if search term contains wildcard characters (* or ?)"""
+    return '*' in term or '?' in term
+
+
+def build_wildcard_query(term: str, fields: list) -> dict:
+    """
+    Build wildcard query
+    Supports * (match any characters) and ? (match single character)
+    """
+    # Convert to lowercase for case-insensitive search
+    term_lower = term.lower()
+
+    # Build should query for multiple fields
+    should_clauses = []
+    for field in fields:
+        should_clauses.append({
+            "wildcard": {
+                field: {
+                    "value": term_lower,
+                    "case_insensitive": True
+                }
+            }
+        })
+
+    return {
+        "bool": {
+            "should": should_clauses,
+            "minimum_should_match": 1
+        }
+    }
+
+
+# Target fields for wildcard search (species name related)
+WILDCARD_SEARCH_FIELDS = [
+    "ScientificName", "ValidName", "Genus", "Family"
+]
+
+
+# ============== Document Field Normalization ==============
+
+# Standard field list for frontend table (ensures consistent document structure)
+STANDARD_DOCUMENT_FIELDS = [
+    "ScientificName", "ValidName", "Genus", "Family",
+    "InstitutionCode", "CollectionCode", "CatalogNumber",
+    "Country", "StateProvince", "County", "Locality",
+    "Latitude", "Longitude", "YearCollected", "MonthCollected", "DayCollected",
+    "BasisOfRecord", "RecordedBy", "Remarks"
+]
+
+
+def normalize_document(doc: dict, fields: list = None) -> dict:
+    """
+    Normalize document fields, ensuring all specified fields exist (fill missing with None).
+    This allows frontend to maintain consistent column structure.
+    """
+    if fields is None:
+        fields = STANDARD_DOCUMENT_FIELDS
+
+    normalized = {}
+    for field in fields:
+        normalized[field] = doc.get(field, None)
+
+    # Preserve other fields in the document (e.g., id, score, etc.)
+    for key, value in doc.items():
+        if key not in normalized:
+            normalized[key] = value
+
+    return normalized
+
+
+# ============== Geo-spatial Utility Functions ==============
 
 def point_in_polygon(lat: float, lon: float, polygon: list) -> bool:
     """
-    射线法判断点是否在多边形内
-    polygon: [[lon, lat], [lon, lat], ...] 多边形顶点坐标（需要闭合，首尾相同）
+    Ray casting algorithm to determine if point is inside polygon.
+    polygon: [[lon, lat], [lon, lat], ...] polygon vertices (must be closed, first == last)
     """
     n = len(polygon)
     inside = False
@@ -20,7 +93,7 @@ def point_in_polygon(lat: float, lon: float, polygon: list) -> bool:
         xi, yi = polygon[i][0], polygon[i][1]  # lon, lat
         xj, yj = polygon[j][0], polygon[j][1]
 
-        # 检查点是否在边的y范围内，并计算交点
+        # Check if point is within edge's y range and calculate intersection
         if ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi):
             inside = not inside
         j = i
@@ -30,10 +103,10 @@ def point_in_polygon(lat: float, lon: float, polygon: list) -> bool:
 
 def point_in_circle(lat: float, lon: float, center_lat: float, center_lon: float, radius_meters: float) -> bool:
     """
-    判断点是否在圆形范围内
-    使用 Haversine 公式计算距离
+    Determine if point is within circular area.
+    Uses Haversine formula to calculate distance.
     """
-    R = 6371000  # 地球半径（米）
+    R = 6371000  # Earth radius in meters
 
     lat1_rad = math.radians(center_lat)
     lat2_rad = math.radians(lat)
@@ -49,15 +122,15 @@ def point_in_circle(lat: float, lon: float, center_lat: float, center_lon: float
 
 def calculate_bounding_box(geo_filter) -> dict:
     """
-    从 geo_filter 计算 bounding box
-    返回 {"min_lat": ..., "max_lat": ..., "min_lon": ..., "max_lon": ...}
+    Calculate bounding box from geo_filter.
+    Returns {"min_lat": ..., "max_lat": ..., "min_lon": ..., "max_lon": ...}
     """
     if geo_filter.type == "circle":
-        # 圆形：从圆心和半径计算近似的 bounding box
+        # Circle: calculate approximate bounding box from center and radius
         center_lon, center_lat = geo_filter.coordinates[0]
-        radius_meters = geo_filter.radius or 10000  # 默认10km
+        radius_meters = geo_filter.radius or 10000  # Default 10km
 
-        # 1度纬度约111km，1度经度约111km * cos(lat)
+        # 1 degree latitude ~= 111km, 1 degree longitude ~= 111km * cos(lat)
         lat_offset = radius_meters / 111000
         lon_offset = radius_meters / (111000 * math.cos(math.radians(center_lat)))
 
@@ -68,7 +141,7 @@ def calculate_bounding_box(geo_filter) -> dict:
             "max_lon": center_lon + lon_offset
         }
     else:
-        # 多边形或矩形：取所有顶点的极值
+        # Polygon or rectangle: get min/max from all vertices
         lons = [coord[0] for coord in geo_filter.coordinates]
         lats = [coord[1] for coord in geo_filter.coordinates]
 
@@ -82,8 +155,8 @@ def calculate_bounding_box(geo_filter) -> dict:
 
 def filter_by_geo(hits: list, geo_filter) -> list:
     """
-    对搜索结果进行精确的地理筛选
-    hits: ES返回的 _source 列表
+    Perform precise geo filtering on search results.
+    hits: list of _source from ES response
     """
     if not geo_filter:
         return hits
@@ -93,7 +166,7 @@ def filter_by_geo(hits: list, geo_filter) -> list:
         lat = hit.get("Latitude")
         lon = hit.get("Longitude")
 
-        # 跳过没有坐标的记录
+        # Skip records without coordinates
         if lat is None or lon is None:
             continue
 
@@ -103,16 +176,16 @@ def filter_by_geo(hits: list, geo_filter) -> list:
         except (ValueError, TypeError):
             continue
 
-        # 根据类型判断
+        # Check based on geo filter type
         if geo_filter.type == "circle":
             center_lon, center_lat = geo_filter.coordinates[0]
             radius = geo_filter.radius or 10000
             if point_in_circle(lat, lon, center_lat, center_lon, radius):
                 filtered.append(hit)
         else:
-            # polygon 或 rectangle
+            # polygon or rectangle
             polygon = geo_filter.coordinates
-            # 确保多边形闭合
+            # Ensure polygon is closed
             if polygon[0] != polygon[-1]:
                 polygon = polygon + [polygon[0]]
             if point_in_polygon(lat, lon, polygon):
@@ -120,7 +193,7 @@ def filter_by_geo(hits: list, geo_filter) -> list:
 
     return filtered
 
-# ============== 地理空间工具函数结束 ==============
+# ============== End of Geo-spatial Utility Functions ==============
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, func, text, desc, asc
@@ -291,30 +364,30 @@ class Condition(BaseModel):
     orConditions: List[OrCondition] = []
 
 class FilterValue(BaseModel):
-    """支持多选和范围筛选的值类型"""
-    values: Optional[List[str]] = None  # 多选值列表
-    range_min: Optional[float] = None   # 范围最小值
-    range_max: Optional[float] = None   # 范围最大值
+    """Value type supporting multi-select and range filtering"""
+    values: Optional[List[str]] = None  # Multi-select value list
+    range_min: Optional[float] = None   # Range minimum value
+    range_max: Optional[float] = None   # Range maximum value
 
 class GeoFilter(BaseModel):
-    """地理筛选条件"""
+    """Geo filtering conditions"""
     type: str = "polygon"  # polygon, rectangle, circle
-    coordinates: List[List[float]]  # [[lon, lat], [lon, lat], ...] 多边形顶点坐标
-    # circle 类型时: coordinates = [[center_lon, center_lat]], radius 必填
-    radius: Optional[float] = None  # 圆形半径（米），仅 circle 类型使用
+    coordinates: List[List[float]]  # [[lon, lat], [lon, lat], ...] polygon vertices
+    # For circle type: coordinates = [[center_lon, center_lat]], radius required
+    radius: Optional[float] = None  # Circle radius (meters), only for circle type
 
 class SearchPayload(BaseModel):
-    term: Optional[str] = None  # term 为简单搜索关键词，可选
-    conditions: Optional[List[Condition]] = None  # conditions 为高级搜索条件，可选
-    filter_conditions: Optional[Dict[str, str]] = None  # 旧版：单选筛选条件
-    multi_filters: Optional[Dict[str, List[str]]] = None  # 新增：多选筛选条件
-    range_filters: Optional[Dict[str, Dict[str, float]]] = None  # 新增：范围筛选条件 {"YearCollected": {"min": 1900, "max": 2024}}
-    geo_filter: Optional[GeoFilter] = None  # 新增：地理筛选条件
+    term: Optional[str] = None  # Simple search keyword, optional
+    conditions: Optional[List[Condition]] = None  # Advanced search conditions, optional
+    filter_conditions: Optional[Dict[str, str]] = None  # Legacy: single-select filter
+    multi_filters: Optional[Dict[str, List[str]]] = None  # Multi-select filter conditions
+    range_filters: Optional[Dict[str, Dict[str, float]]] = None  # Range filters {"YearCollected": {"min": 1900, "max": 2024}}
+    geo_filter: Optional[GeoFilter] = None  # Geo filter conditions
     page: int = 0
     page_size: int = 10
 
 def apply_sort(query, sort_by: str, model_class):
-    """应用排序"""
+    """Apply sorting"""
     if sort_by == "records_desc":
         return query.order_by(desc("record_count"))
     elif sort_by == "records_asc":
@@ -331,7 +404,7 @@ def apply_sort(query, sort_by: str, model_class):
         return query.order_by(desc("record_count"))
 
 def apply_record_count_filter(query, record_count: str, count_field: str = "record_count"):
-    """应用记录数过滤"""
+    """Apply record count filter"""
     if record_count == "high":
         return query.having(text(f"{count_field} > 1000"))
     elif record_count == "medium":
@@ -342,15 +415,15 @@ def apply_record_count_filter(query, record_count: str, count_field: str = "reco
 
 def build_es_query(conditions: List[Condition]) -> dict:
     """
-    根据用户条件构建 Elasticsearch 查询 DSL。
+    Build Elasticsearch query DSL from user conditions.
     """
     must_clauses = []
 
     for condition in conditions:
-        # 构建主条件的查询
+        # Build query for main condition
         main_query = build_field_query(condition.field, condition.operator, condition.value)
 
-        # 如果存在 OR 子条件，构建 should 查询
+        # If OR sub-conditions exist, build should query
         if condition.orConditions:
             should_clauses = [
                 build_field_query(condition.field, or_cond.operator, or_cond.value)
@@ -359,11 +432,11 @@ def build_es_query(conditions: List[Condition]) -> dict:
             main_query = {
                 "bool": {
                     "should": [main_query, *should_clauses],
-                    "minimum_should_match": 1,  # 至少满足一个条件
+                    "minimum_should_match": 1,  # At least one condition must match
                 }
             }
 
-        # 添加主条件到 must 子句
+        # Add main condition to must clause
         must_clauses.append(main_query)
 
     return {"query": {"bool": {"must": must_clauses}}}
@@ -383,32 +456,32 @@ def get_field_types(es, index_name):
 
 def build_field_query(field: str, operator: Optional[str], value: str) -> dict:
     """
-    根据字段和操作符生成 Elasticsearch 查询。
-    - 数字字段支持范围查询（>, <, >=, <= 等）。
-    - 字符串字段支持精确匹配、模糊匹配、通配符、前缀等。
-    - 枚举字段支持多选。
+    Generate Elasticsearch query based on field and operator.
+    - Numeric fields support range queries (>, <, >=, <=, etc.).
+    - String fields support exact match, fuzzy match, wildcard, prefix, etc.
+    - Enum fields support multi-select.
     """
-    # 如果未提供操作符，根据字段类型设置默认操作符
+    # If no operator provided, set default based on field type
     if not operator: # none and ''
-        # 默认逻辑：根据值类型判断操作符
+        # Default logic: determine operator based on value type
         if isinstance(value, str):
-            operator = "contains"  # 字符串默认为模糊匹配
+            operator = "contains"  # Default to fuzzy match for strings
         elif isinstance(value, bool):
-            operator = "="  # 布尔值默认为精确匹配
+            operator = "="  # Default to exact match for booleans
         elif isinstance(value, list):
-            operator = "in"  # 列表（枚举值）默认为多选
+            operator = "in"  # Default to multi-select for lists (enums)
         else:
             raise ValueError(f"Unsupported type for field {field} with value {value}")
 
-    # 根据操作符生成对应的查询
+    # Generate corresponding query based on operator
     if operator == "=":
-        # 精确匹配 (使用 keyword 字段)
+        # Exact match (using keyword field)
         return {"term": {f"{field}.keyword": value}}
     elif operator == "!=":
-        # 排除匹配
+        # Exclude match
         return {"bool": {"must_not": {"term": {f"{field}.keyword": value}}}}
     elif operator in [">", "<", ">=", "<="]:
-        # 范围查询，适用于数字类型
+        # Range query, for numeric types
         range_operators = {
             ">": "gt",
             "<": "lt",
@@ -417,27 +490,27 @@ def build_field_query(field: str, operator: Optional[str], value: str) -> dict:
         }
         return {"range": {field: {range_operators[operator]: value}}}
     elif operator == "contains":
-        # 模糊匹配 (分词匹配)，适用于字符串类型
+        # Fuzzy match (tokenized), for string types
         return {"match": {field: value}}
     elif operator == "phrase":
-        # 短语匹配 (精确短语)
+        # Phrase match (exact phrase)
         return {"match_phrase": {field: value}}
     elif operator == "prefix":
-        # 前缀匹配 (以...开头)
+        # Prefix match (starts with...)
         return {"prefix": {f"{field}.keyword": {"value": value, "case_insensitive": True}}}
     elif operator == "wildcard":
-        # 通配符匹配 (* 和 ?)
-        # 自动添加通配符如果用户没有提供
+        # Wildcard match (* and ?)
+        # Auto-add wildcards if user didn't provide them
         wildcard_value = value if '*' in value or '?' in value else f"*{value}*"
         return {"wildcard": {f"{field}.keyword": {"value": wildcard_value, "case_insensitive": True}}}
     elif operator == "fuzzy":
-        # 模糊匹配 (拼写纠错)
+        # Fuzzy match (spelling correction)
         return {"fuzzy": {f"{field}.keyword": {"value": value, "fuzziness": "AUTO"}}}
     elif operator == "regexp":
-        # 正则表达式匹配
+        # Regular expression match
         return {"regexp": {f"{field}.keyword": {"value": value, "case_insensitive": True}}}
     elif operator == "in":
-        # 多选（适用于枚举或多值字段）
+        # Multi-select (for enum or multi-value fields)
         return {"terms": {f"{field}.keyword": value if isinstance(value, list) else [value]}}
     else:
         raise ValueError(f"Unsupported operator: {operator}")
@@ -449,7 +522,7 @@ async def aggregation(payload: Optional[SearchPayload] = None, term: Optional[st
     Aggregated Statistics API: Supports Simple Search (term)
     """
     try:
-        # 动态构建查询
+        # Dynamically build query
         es_query = {
             "size": 0,
             "query": {},
@@ -472,22 +545,52 @@ async def aggregation(payload: Optional[SearchPayload] = None, term: Optional[st
         }
 
         if term:
-            es_query["query"] = {
-                "multi_match": {
-                    "query": term,
-                    "fields": ["ScientificName", "Family", "InstitutionCode", "CatalogNumber", "CollectionCode"]
+            # Check if wildcard search
+            if has_wildcard(term):
+                es_query["query"] = build_wildcard_query(term, WILDCARD_SEARCH_FIELDS)
+            else:
+                # Smart search: supports synonym (ValidName), fuzzy match, phonetic search
+                es_query["query"] = {
+                    "bool": {
+                        "should": [
+                            # Exact match (highest weight) - includes synonym field
+                            {"multi_match": {
+                                "query": term,
+                                "fields": ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
+                                          "InstitutionCode", "CollectionCode", "CatalogNumber",
+                                          "Country", "StateProvince", "Locality"],
+                                "boost": 3
+                            }},
+                            # Fuzzy match (allows spelling errors) - text fields, excluding CatalogNumber
+                            {"multi_match": {
+                                "query": term,
+                                "fields": ["ScientificName", "ValidName", "Genus", "Family",
+                                          "InstitutionCode", "CollectionCode",
+                                          "Country", "StateProvince", "Locality"],
+                                "fuzziness": "AUTO",
+                                "boost": 2
+                            }},
+                            # Phonetic match (similar pronunciation) - species name fields only
+                            {"multi_match": {
+                                "query": term,
+                                "fields": ["ScientificName.phonetic", "ValidName.phonetic",
+                                          "Genus.phonetic", "Family.phonetic"],
+                                "boost": 1
+                            }}
+                        ],
+                        "minimum_should_match": 1
+                    }
                 }
-            }
         elif payload and payload.conditions:
             es_query["query"] = build_es_query(payload.conditions)["query"]
         else:
-            # 如果没有 term 或 conditions，则返回空聚合
+            # If no term or conditions, return empty aggregation
             es_query["query"] = {"match_all": {}}
 
-        # 执行查询
-        response = es.search(index="mrservice_index", body=es_query)
+        # Execute query
+        response = es.search(index=settings.ES_INDEX, body=es_query)
 
-        # 解析结果
+        # Parse results
         aggregations = response.get("aggregations", {})
         scientificname_buckets = aggregations.get("ScientificName", {}).get("buckets", [])
         family_buckets = aggregations.get("Family", {}).get("buckets", [])
@@ -509,7 +612,7 @@ async def aggregation(payload: Optional[SearchPayload] = None):
     Aggregated Statistics API: Supports Advanced Search (conditions)
     """
     try:
-        # 构建查询
+        # Build query
         es_query = {
             "size": 0,
             "query": {},
@@ -553,27 +656,54 @@ async def aggregation(payload: Optional[SearchPayload] = None):
             }
         }
 
-        # 根据简单搜索或高级搜索条件动态构建查询部分
+        # Dynamically build query based on simple or advanced search conditions
         if payload.term:
-            es_query["query"] = {
-                "multi_match": {
-                    "query": payload.term,
-                    "fields": [
-                         "ScientificName", "Family",  # Taxon 相关字段
-                        "InstitutionCode", "CollectionCode",  # Occurrence 相关字段
-                        "Country", "StateProvince", "County"  # Location 相关字段
-                    ]
+            # Check if wildcard search
+            if has_wildcard(payload.term):
+                es_query["query"] = build_wildcard_query(payload.term, WILDCARD_SEARCH_FIELDS)
+            else:
+                # Smart search: supports synonym (ValidName), fuzzy match, phonetic search
+                es_query["query"] = {
+                    "bool": {
+                        "should": [
+                            # Exact match (highest weight) - includes synonym field
+                            {"multi_match": {
+                                "query": payload.term,
+                                "fields": ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
+                                          "InstitutionCode", "CollectionCode", "CatalogNumber",
+                                          "Country", "StateProvince", "County", "Locality"],
+                                "boost": 3
+                            }},
+                            # Fuzzy match (allows spelling errors) - text fields, excluding CatalogNumber
+                            {"multi_match": {
+                                "query": payload.term,
+                                "fields": ["ScientificName", "ValidName", "Genus", "Family",
+                                          "InstitutionCode", "CollectionCode",
+                                          "Country", "StateProvince", "County", "Locality"],
+                                "fuzziness": "AUTO",
+                                "boost": 2
+                            }},
+                            # Phonetic match (similar pronunciation) - species name fields only
+                            {"multi_match": {
+                                "query": payload.term,
+                                "fields": ["ScientificName.phonetic", "ValidName.phonetic",
+                                          "Genus.phonetic", "Family.phonetic"],
+                                "boost": 1
+                            }}
+                        ],
+                        "minimum_should_match": 1
+                    }
                 }
-            }
         elif payload and payload.conditions:
             es_query["query"] = build_es_query(payload.conditions)["query"]
         else:
             es_query["query"] = {"match_all": {}}
 
-        # 执行查询
-        response = es.search(index="mrservice_full_index", body=es_query)
+        # Execute query
+        # response = es.search(index=settings.ES_INDEX, body=es_query)
+        response = es.search(index=settings.ES_INDEX, body=es_query)
 
-        # 解析结果
+        # Parse results
         aggs = response.get("aggregations", {})
         taxon = aggs.get("Taxon", {})
         occurrence = aggs.get("Occurrence", {})
@@ -618,62 +748,169 @@ async def aggregation(payload: Optional[SearchPayload] = None):
 @app.get("/search",tags=["Search"],summary="Simple Search")
 async def search(
     term: str,
-    page: int = Query(0, ge=0),        # 页码，默认为 0
-    page_size: int = Query(10, gt=0)  # 每页条数，默认为 10
+    page: int = Query(0, ge=0),        # Page number, default 0
+    page_size: int = Query(10, gt=0),  # Page size, default 10
+    fuzzy_threshold: int = Query(5)    # Auto-enable fuzzy search when exact results < this
 ):
-    # Elasticsearch 查询主体
-    query = {
-        "query": {
-            "multi_match": {
-                "query": term,
-                "fields": ["ScientificName", "Family", "InstitutionCode", "CatalogNumber", "CollectionCode"]
+    """
+    Smart search:
+    1. Supports wildcard search (* matches any chars, ? matches single char)
+    2. First try exact search (includes synonym ValidName)
+    3. If results < fuzzy_threshold, auto-enable fuzzy + phonetic search
+    4. Results sorted by relevance, exact matches first
+    """
+
+    # Check if wildcard search
+    if has_wildcard(term):
+        wildcard_query = build_wildcard_query(term, WILDCARD_SEARCH_FIELDS)
+
+        aggregations_config = {
+            "scientificname_count": {"terms": {"field": "ScientificName.keyword", "size": 10}},
+            "family_count": {"terms": {"field": "Family.keyword", "size": 10}}
+        }
+
+        source_fields = ["ScientificName", "ValidName", "Family", "InstitutionCode", "CatalogNumber", "CollectionCode"]
+
+        try:
+            query = {
+                "query": wildcard_query,
+                "size": page_size,
+                "from": page * page_size,
+                "track_total_hits": True,
+                "_source": source_fields,
+                "aggregations": aggregations_config
             }
-        },
-        "size": page_size,          # 分页大小
-        "from": page * page_size,   # 分页起始位置
-        "track_total_hits": True,
-        "_source": ["ScientificName", "Family", "InstitutionCode", "CatalogNumber", "CollectionCode"],  # 返回字段
-        "aggregations": {           # 聚合统计
-            "scientificname_count": {
-                "terms": {
-                    "field": "ScientificName.keyword",
-                    "size": 10
-                }
-            },
-            "family_count": {
-                "terms": {
-                    "field": "Family.keyword",
-                    "size": 10
+
+            response = es.search(index=settings.ES_INDEX, body=query)
+
+            hits = response["hits"]["hits"]
+            documents = [
+                normalize_document({
+                    "id": hit["_id"],
+                    "score": hit.get("_score", 0),
+                    **hit["_source"]
+                })
+                for hit in hits
+            ]
+
+            aggregations = response.get("aggregations", {})
+            scientificname_buckets = aggregations.get("scientificname_count", {}).get("buckets", [])
+            family_buckets = aggregations.get("family_count", {}).get("buckets", [])
+            occurrence_count = response["hits"]["total"]["value"]
+
+            return {
+                "search_mode": "wildcard",
+                "documents": documents,
+                "aggregations": {
+                    "ScientificName": [{"key": bucket["key"], "doc_count": bucket["doc_count"]} for bucket in scientificname_buckets],
+                    "Family": [{"key": bucket["key"], "doc_count": bucket["doc_count"]} for bucket in family_buckets],
+                    "Occurrence": occurrence_count,
                 }
             }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # Exact search query body (includes synonyms)
+    exact_query_body = {
+        "multi_match": {
+            "query": term,
+            "fields": ["ScientificName", "ValidName", "Genus", "Family",
+                      "InstitutionCode", "CollectionCode", "CatalogNumber",
+                      "Country", "StateProvince", "Locality"]
         }
     }
 
-    try:
-        # 查询 Elasticsearch
-        response = es.search(index="mrservice_full_index", body=query)
+    # Fuzzy + phonetic search query body
+    fuzzy_query_body = {
+        "bool": {
+            "should": [
+                # Exact match (highest weight)
+                {"multi_match": {
+                    "query": term,
+                    "fields": ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
+                              "InstitutionCode", "CollectionCode", "CatalogNumber",
+                              "Country", "StateProvince", "Locality"],
+                    "boost": 3
+                }},
+                # Fuzzy match (allows spelling errors) - text fields, excluding CatalogNumber
+                {"multi_match": {
+                    "query": term,
+                    "fields": ["ScientificName", "ValidName", "Genus", "Family",
+                              "InstitutionCode", "CollectionCode",
+                              "Country", "StateProvince", "Locality"],
+                    "fuzziness": "AUTO",
+                    "boost": 2
+                }},
+                # Phonetic match (similar pronunciation) - species name fields only
+                {"multi_match": {
+                    "query": term,
+                    "fields": ["ScientificName.phonetic", "ValidName.phonetic",
+                              "Genus.phonetic", "Family.phonetic"],
+                    "boost": 1
+                }}
+            ],
+            "minimum_should_match": 1
+        }
+    }
 
-        # 解析分页结果
+    aggregations_config = {
+        "scientificname_count": {
+            "terms": {"field": "ScientificName.keyword", "size": 10}
+        },
+        "family_count": {
+            "terms": {"field": "Family.keyword", "size": 10}
+        }
+    }
+
+    source_fields = ["ScientificName", "ValidName", "Family", "InstitutionCode", "CatalogNumber", "CollectionCode"]
+
+    try:
+        # Step 1: Exact search
+        exact_query = {
+            "query": exact_query_body,
+            "size": page_size,
+            "from": page * page_size,
+            "track_total_hits": True,
+            "_source": source_fields,
+            "aggregations": aggregations_config
+        }
+
+        response = es.search(index=settings.ES_INDEX, body=exact_query)
+        total_hits = response["hits"]["total"]["value"]
+        search_mode = "exact"
+
+        # Step 2: If exact results too few, auto fallback to fuzzy search
+        if total_hits < fuzzy_threshold:
+            fuzzy_query = {
+                "query": fuzzy_query_body,
+                "size": page_size,
+                "from": page * page_size,
+                "track_total_hits": True,
+                "_source": source_fields,
+                "aggregations": aggregations_config
+            }
+            response = es.search(index=settings.ES_INDEX, body=fuzzy_query)
+            search_mode = "fuzzy"
+
+        # Parse results, normalize fields for consistency
         hits = response["hits"]["hits"]
         documents = [
-            {
-                "id": hit["_id"],  # Elasticsearch 文档 ID
-                **hit["_source"]   # 文档内容
-            }
+            normalize_document({
+                "id": hit["_id"],
+                "score": hit.get("_score", 0),
+                **hit["_source"]
+            })
             for hit in hits
         ]
 
-        # 解析聚合数据
         aggregations = response.get("aggregations", {})
         scientificname_buckets = aggregations.get("scientificname_count", {}).get("buckets", [])
         family_buckets = aggregations.get("family_count", {}).get("buckets", [])
-
-        # 获取 occurrence 统计
         occurrence_count = response["hits"]["total"]["value"]
 
-        # 返回结果
         return {
-            "documents": documents,                    # 当前分页的文档信息
+            "search_mode": search_mode,  # Inform frontend which search mode was used
+            "documents": documents,
             "aggregations": {
                 "ScientificName": [
                     {"key": bucket["key"], "doc_count": bucket["doc_count"]}
@@ -694,7 +931,7 @@ async def adsearch(payload: SearchPayload):
     try:
         filter_conditions = payload.filter_conditions or {}
 
-        field_types = get_field_types(es, "mrservice_full_index")
+        field_types = get_field_types(es, settings.ES_INDEX)
 
         # Separate fields by type
         text_fields = [field for field, ftype in field_types.items() if ftype in ["text", "keyword"]]
@@ -713,30 +950,70 @@ async def adsearch(payload: SearchPayload):
         if payload.term:
             # Determine term type and select fields accordingly
             if isinstance(payload.term, str):
-                fields = text_fields
+                # Check if wildcard search
+                if has_wildcard(payload.term):
+                    es_query["query"] = build_wildcard_query(payload.term, WILDCARD_SEARCH_FIELDS)
+                else:
+                    # Smart search: supports synonym (ValidName), fuzzy match, phonetic search
+                    es_query["query"] = {
+                        "bool": {
+                            "should": [
+                                # Exact match (highest weight) - includes synonym field
+                                {"multi_match": {
+                                    "query": payload.term,
+                                    "fields": ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
+                                              "InstitutionCode", "CollectionCode", "CatalogNumber",
+                                              "Country", "StateProvince", "Locality"],
+                                    "boost": 3
+                                }},
+                                # Fuzzy match (allows spelling errors) - text fields, excluding CatalogNumber
+                                {"multi_match": {
+                                    "query": payload.term,
+                                    "fields": ["ScientificName", "ValidName", "Genus", "Family",
+                                              "InstitutionCode", "CollectionCode",
+                                              "Country", "StateProvince", "Locality"],
+                                    "fuzziness": "AUTO",
+                                    "boost": 2
+                                }},
+                                # Phonetic match (similar pronunciation) - species name fields only
+                                {"multi_match": {
+                                    "query": payload.term,
+                                    "fields": ["ScientificName.phonetic", "ValidName.phonetic",
+                                              "Genus.phonetic", "Family.phonetic"],
+                                    "boost": 1
+                                }}
+                            ],
+                            "minimum_should_match": 1
+                        }
+                    }
             elif isinstance(payload.term, (int, float)):
                 fields = numeric_fields
+                es_query["query"] = {
+                    "multi_match": {
+                        "query": payload.term,
+                        "fields": fields
+                    }
+                }
             elif isinstance(payload.term, (datetime, str)):  # Date input
                 fields = date_fields
+                es_query["query"] = {
+                    "multi_match": {
+                        "query": payload.term,
+                        "fields": fields
+                    }
+                }
             else:
                 raise HTTPException(status_code=400, detail="Unsupported term type.")
-            # Simple search logic
-            es_query["query"] = {
-                "multi_match": {
-                    "query": payload.term,
-                    "fields": fields
-                }
-            }
         elif payload.conditions:
-            # 高级搜索逻辑
+            # Advanced search logic
             es_query["query"] = build_es_query(payload.conditions)["query"]
         else:
             raise HTTPException(status_code=400, detail="Either 'term' or 'conditions' must be provided.")
 
-        # Execute query with filters (支持旧版单选、新版多选和范围筛选)
+        # Execute query with filters (supports legacy single-select, multi-select, and range filters)
         filter_clauses = []
 
-        # 旧版单选筛选条件
+        # Legacy single-select filter conditions
         if filter_conditions:
             for key, value in filter_conditions.items():
                 # For normalized fields, search all variations
@@ -746,7 +1023,7 @@ async def adsearch(payload: SearchPayload):
                 else:
                     filter_clauses.append({"term": {f"{key}.keyword": value}})
 
-        # 新版多选筛选条件
+        # Multi-select filter conditions
         multi_filters = payload.multi_filters or {}
         for key, values in multi_filters.items():
             if values and len(values) > 0:
@@ -759,7 +1036,7 @@ async def adsearch(payload: SearchPayload):
                 else:
                     filter_clauses.append({"terms": {f"{key}.keyword": values}})
 
-        # 范围筛选条件
+        # Range filter conditions
         range_filters = payload.range_filters or {}
         for key, range_values in range_filters.items():
             range_query = {}
@@ -770,11 +1047,11 @@ async def adsearch(payload: SearchPayload):
             if range_query:
                 filter_clauses.append({"range": {key: range_query}})
 
-        # 地理筛选条件 - 先用 bounding box 快速过滤
+        # Geo filter conditions - use bounding box for fast initial filtering
         geo_filter = payload.geo_filter
         if geo_filter and geo_filter.coordinates:
             bbox = calculate_bounding_box(geo_filter)
-            # 添加 bounding box 范围查询（快速筛选）
+            # Add bounding box range query (fast filtering)
             filter_clauses.append({
                 "bool": {
                     "must": [
@@ -799,8 +1076,8 @@ async def adsearch(payload: SearchPayload):
                         "filter": filter_clauses
                     }
                 }
-        # response = es.search(index="mrservice_index", body=es_query)
-        response = es.search(index="mrservice_full_index", body=es_query)
+        # response = es.search(index=settings.ES_INDEX, body=es_query)
+        response = es.search(index=settings.ES_INDEX, body=es_query)
         hits = response["hits"]["hits"]
         total = response["hits"]["total"]["value"]
 
@@ -840,7 +1117,7 @@ async def adsearch(payload: SearchPayload):
             }
         }
 
-        stats_response = es.search(index="mrservice_full_index", body=stats_query)
+        stats_response = es.search(index=settings.ES_INDEX, body=stats_query)
         aggs = stats_response["aggregations"]
 
         georef_count = aggs["georeferenced"]["doc_count"]
@@ -901,7 +1178,7 @@ async def adsearch(payload: SearchPayload):
             }
         }
 
-        chart_response = es.search(index="mrservice_full_index", body=chart_query)
+        chart_response = es.search(index=settings.ES_INDEX, body=chart_query)
         chart_aggs = chart_response["aggregations"]
 
         # Process timeline data
@@ -930,44 +1207,44 @@ async def adsearch(payload: SearchPayload):
             if bucket["avg_lat"]["value"] and bucket["avg_lng"]["value"]
         ]
 
-        # 提取 hits 数据
-        hits_data = [hit["_source"] for hit in hits]
+        # Extract hits data, normalize fields for consistency
+        hits_data = [normalize_document(hit["_source"]) for hit in hits]
 
-        # 如果有 geo_filter，进行精确的多边形/圆形过滤
+        # If geo_filter exists, perform precise polygon/circle filtering
         if geo_filter and geo_filter.coordinates:
             hits_data = filter_by_geo(hits_data, geo_filter)
 
         return {
             "hits": hits_data,
-            "total": total,  # 注意：这是 bounding box 筛选后的总数，精确过滤后可能略少
+            "total": total,  # Note: This is the count after bounding box filter, may be slightly less after precise filtering
             "stats": stats,
             "charts": {
                 "timeline": timeline_data,
                 "diversity": diversity_data,
                 "mapPoints": map_points
             },
-            "geo_filtered": geo_filter is not None  # 标记是否进行了地理筛选
+            "geo_filtered": geo_filter is not None  # Flag whether geo filtering was applied
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 class CustomAggregationPayload(BaseModel):
-    field: str  # 要聚合的字段名
-    size: int = 10  # 返回的桶数量
-    term: Optional[str] = None  # 可选的搜索词
-    conditions: Optional[List[Condition]] = None  # 可选的高级搜索条件
+    field: str  # Field name to aggregate
+    size: int = 10  # Number of buckets to return
+    term: Optional[str] = None  # Optional search term
+    conditions: Optional[List[Condition]] = None  # Optional advanced search conditions
 
 
 @app.post("/custom-aggregation", tags=["Search"], summary="Custom Field Aggregation")
 async def custom_aggregation(payload: CustomAggregationPayload):
     """
-    自定义字段聚合API：用于生成用户选择字段的统计图表
-    支持的字段：ScientificName, Family, Genus, Order, Class, Country, StateProvince,
+    Custom field aggregation API: Generate statistical charts for user-selected fields.
+    Supported fields: ScientificName, Family, Genus, Order, Class, Country, StateProvince,
     County, InstitutionCode, CollectionCode, YearCollected, BasisOfRecord, RecordedBy
     """
     try:
-        # 验证字段名
+        # Validate field name
         allowed_fields = [
             'ScientificName', 'Family', 'Genus', 'Order', 'Class',
             'Country', 'StateProvince', 'County',
@@ -981,7 +1258,7 @@ async def custom_aggregation(payload: CustomAggregationPayload):
                 detail=f"Invalid field. Allowed fields: {', '.join(allowed_fields)}"
             )
 
-        # 构建基础查询
+        # Build base query
         base_query = {}
         if payload.term:
             base_query = {
@@ -995,11 +1272,11 @@ async def custom_aggregation(payload: CustomAggregationPayload):
         else:
             base_query = {"match_all": {}}
 
-        # 确定字段类型 - 数字字段不需要 .keyword
+        # Determine field type - numeric fields don't need .keyword
         numeric_fields = ['YearCollected']
         field_name = payload.field if payload.field in numeric_fields else f"{payload.field}.keyword"
 
-        # 构建聚合查询
+        # Build aggregation query
         es_query = {
             "size": 0,
             "query": base_query,
@@ -1019,16 +1296,16 @@ async def custom_aggregation(payload: CustomAggregationPayload):
             }
         }
 
-        # 执行查询
-        response = es.search(index="mrservice_full_index", body=es_query)
+        # Execute query
+        response = es.search(index=settings.ES_INDEX, body=es_query)
 
-        # 解析结果
+        # Parse results
         aggs = response.get("aggregations", {})
         buckets = aggs.get("field_stats", {}).get("buckets", [])
         total_unique = aggs.get("total_unique", {}).get("value", 0)
         total_docs = response.get("hits", {}).get("total", {}).get("value", 0)
 
-        # 过滤空值
+        # Filter empty values
         buckets = [
             {"key": bucket["key"], "doc_count": bucket["doc_count"]}
             for bucket in buckets
@@ -1050,22 +1327,22 @@ async def custom_aggregation(payload: CustomAggregationPayload):
 
 @app.get("/occurrence/{id}",tags=["Occurrence"],summary="Get Occurrence by ID")
 async def get_occurrence(
-    id: int,  # 接收 RESTful 路径参数 id
-    db: Session = Depends(get_db)  # 获取数据库会话
+    id: int,  # RESTful path parameter id
+    db: Session = Depends(get_db)  # Get database session
 ):
-    # SQL 查询
+    # SQL query
     query = text("""
         SELECT * FROM  dbo."MRService"
         WHERE "ID" = :id
     """)
 
     try:
-        # 执行查询
+        # Execute query
         result = db.execute(query, {"id": id}).fetchall()
         if not result:
             raise HTTPException(status_code=404, detail=f"Occurrence with id {id} not found")
 
-        # 转换为字典返回
+        # Convert to dictionary and return
         occurrence = result[0]._asdict()
 
         return {"occurrence": occurrence}
@@ -1074,22 +1351,22 @@ async def get_occurrence(
 
 @app.get("/occurrences",tags=["Occurrence"],summary="Get Occurrences")
 async def get_occurrence(
-    id: int,  # 接收 RESTful 路径参数 id
-    db: Session = Depends(get_db)  # 获取数据库会话
+    id: int,  # RESTful path parameter id
+    db: Session = Depends(get_db)  # Get database session
 ):
-    # SQL 查询
+    # SQL query
     query = text("""
         SELECT * FROM  dbo."MRService"
         WHERE "ID" = :id
     """)
 
     try:
-        # 执行查询
+        # Execute query
         result = db.execute(query, {"id": id}).fetchall()
         if not result:
             raise HTTPException(status_code=404, detail=f"Occurrence with id {id} not found")
 
-        # 转换为字典返回
+        # Convert to dictionary and return
         occurrence = result[0]._asdict()
 
         return {"occurrence": occurrence}
@@ -1098,22 +1375,22 @@ async def get_occurrence(
 
 @app.get("/occurrences/{term}",tags=["Occurrence"],summary="Get Occurrences by user defined terms")
 async def get_occurrence(
-    id: int,  # 接收 RESTful 路径参数 id
-    db: Session = Depends(get_db)  # 获取数据库会话
+    id: int,  # RESTful path parameter id
+    db: Session = Depends(get_db)  # Get database session
 ):
-    # SQL 查询
+    # SQL query
     query = text("""
         SELECT * FROM  dbo."MRService"
         WHERE "ID" = :id
     """)
 
     try:
-        # 执行查询
+        # Execute query
         result = db.execute(query, {"id": id}).fetchall()
         if not result:
             raise HTTPException(status_code=404, detail=f"Occurrence with id {id} not found")
 
-        # 转换为字典返回
+        # Convert to dictionary and return
         occurrence = result[0]._asdict()
 
         return {"occurrence": occurrence}
@@ -1123,22 +1400,22 @@ async def get_occurrence(
 
 @app.get("/ESIndexCon",tags=["ElasticSearch"],summary="Get ES connection")
 async def get_occurrence(
-    id: int,  # 接收 RESTful 路径参数 id
-    db: Session = Depends(get_db)  # 获取数据库会话
+    id: int,  # RESTful path parameter id
+    db: Session = Depends(get_db)  # Get database session
 ):
-    # SQL 查询
+    # SQL query
     query = text("""
         SELECT * FROM  dbo."MRService"
         WHERE "ID" = :id
     """)
 
     try:
-        # 执行查询
+        # Execute query
         result = db.execute(query, {"id": id}).fetchall()
         if not result:
             raise HTTPException(status_code=404, detail=f"Occurrence with id {id} not found")
 
-        # 转换为字典返回
+        # Convert to dictionary and return
         occurrence = result[0]._asdict()
 
         return {"occurrence": occurrence}
@@ -1147,22 +1424,22 @@ async def get_occurrence(
 
 @app.get("/ESIndex",tags=["ElasticSearch"],summary="Get ES index ")
 async def get_occurrence(
-    id: int,  # 接收 RESTful 路径参数 id
-    db: Session = Depends(get_db)  # 获取数据库会话
+    id: int,  # RESTful path parameter id
+    db: Session = Depends(get_db)  # Get database session
 ):
-    # SQL 查询
+    # SQL query
     query = text("""
         SELECT * FROM  dbo."MRService"
         WHERE "ID" = :id
     """)
 
     try:
-        # 执行查询
+        # Execute query
         result = db.execute(query, {"id": id}).fetchall()
         if not result:
             raise HTTPException(status_code=404, detail=f"Occurrence with id {id} not found")
 
-        # 转换为字典返回
+        # Convert to dictionary and return
         occurrence = result[0]._asdict()
 
         return {"occurrence": occurrence}
@@ -1171,22 +1448,22 @@ async def get_occurrence(
 
 @app.get("/ESIndexRebuild",tags=["ElasticSearch"],summary="Rebuild ES Index")
 async def get_occurrence(
-    id: int,  # 接收 RESTful 路径参数 id
-    db: Session = Depends(get_db)  # 获取数据库会话
+    id: int,  # RESTful path parameter id
+    db: Session = Depends(get_db)  # Get database session
 ):
-    # SQL 查询
+    # SQL query
     query = text("""
         SELECT * FROM  dbo."MRService"
         WHERE "ID" = :id
     """)
 
     try:
-        # 执行查询
+        # Execute query
         result = db.execute(query, {"id": id}).fetchall()
         if not result:
             raise HTTPException(status_code=404, detail=f"Occurrence with id {id} not found")
 
-        # 转换为字典返回
+        # Convert to dictionary and return
         occurrence = result[0]._asdict()
 
         return {"occurrence": occurrence}
@@ -1195,22 +1472,22 @@ async def get_occurrence(
 
 @app.get("/ESIndexBuild",tags=["ElasticSearch"],summary="Build ES Index")
 async def get_occurrence(
-    id: int,  # 接收 RESTful 路径参数 id
-    db: Session = Depends(get_db)  # 获取数据库会话
+    id: int,  # RESTful path parameter id
+    db: Session = Depends(get_db)  # Get database session
 ):
-    # SQL 查询
+    # SQL query
     query = text("""
         SELECT * FROM  dbo."MRService"
         WHERE "ID" = :id
     """)
 
     try:
-        # 执行查询
+        # Execute query
         result = db.execute(query, {"id": id}).fetchall()
         if not result:
             raise HTTPException(status_code=404, detail=f"Occurrence with id {id} not found")
 
-        # 转换为字典返回
+        # Convert to dictionary and return
         occurrence = result[0]._asdict()
 
         return {"occurrence": occurrence}
@@ -1223,8 +1500,8 @@ async def get_families(
         params: TaxonomyFilterParams = Depends(),
         db: Session = Depends(get_db)
 ):
-    """获取所有科"""
-    # 构建基础查询
+    """Get all families"""
+    # Build base query
     base_select = """
         SELECT family, "order", genera_count, species_count, record_count, 
                countries_count, institutions_count, georeferencing_quality, 
@@ -1232,7 +1509,7 @@ async def get_families(
         FROM dbo.family_stats
     """
 
-    # 构建WHERE条件
+    # Build WHERE conditions
     conditions = []
     params_dict = {}
 
@@ -1244,7 +1521,7 @@ async def get_families(
         conditions.append("\"order\" = :order_filter")
         params_dict["order_filter"] = params.order
 
-    # 记录数过滤
+    # Record count filter
     if params.record_count:
         if params.record_count == "high":
             conditions.append("record_count > 1000")
@@ -1253,12 +1530,12 @@ async def get_families(
         elif params.record_count == "low":
             conditions.append("record_count < 100")
 
-    # 构建WHERE子句
+    # Build WHERE clause
     where_clause = ""
     if conditions:
         where_clause = " WHERE " + " AND ".join(conditions)
 
-    # 排序映射
+    # Sort mapping
     sort_mapping = {
         "records_desc": "record_count DESC",
         "records_asc": "record_count ASC",
@@ -1269,25 +1546,25 @@ async def get_families(
     }
     order_by = sort_mapping.get(params.sort_by, "record_count DESC")
 
-    # 构建完整的数据查询
+    # Build complete data query
     data_query = text(base_select + where_clause + f" ORDER BY {order_by} LIMIT :limit OFFSET :offset")
 
-    # 构建计数查询
+    # Build count query
     count_query = text(f"SELECT COUNT(*) FROM dbo.family_stats{where_clause}")
 
-    # 执行查询
+    # Execute query
     params_dict.update({
         "limit": params.per_page,
         "offset": (params.page - 1) * params.per_page
     })
 
-    # 获取总数
+    # Get total count
     total = db.execute(count_query, {k: v for k, v in params_dict.items() if k not in ['limit', 'offset']}).scalar()
 
-    # 获取数据
+    # Get data
     result = db.execute(data_query, params_dict).fetchall()
 
-    # 转换为前端期望的响应格式 - 使用camelCase
+    # Convert to frontend expected response format - using camelCase
     families = []
     for row in result:
         families.append({
@@ -1315,7 +1592,7 @@ async def get_families(
 
 @app.get("/api/families/{family_name}")
 async def get_family_detail(family_name: str, db: Session = Depends(get_db)):
-    """获取科详情"""
+    """Get family details"""
     query = text("""
         SELECT family, "order", genera_count, species_count, record_count, 
                countries_count, institutions_count, georeferencing_quality, 
@@ -1350,7 +1627,7 @@ async def get_genera(
         params: TaxonomyFilterParams = Depends(),
         db: Session = Depends(get_db)
 ):
-    """获取所有属"""
+    """Get all genera"""
     base_select = """
         SELECT genus, family, "order", species_count, record_count, 
                countries_count, institutions_count, georeferencing_quality, 
@@ -1361,7 +1638,7 @@ async def get_genera(
     conditions = []
     params_dict = {}
 
-    # 添加搜索条件
+    # Add search conditions
     if params.search:
         conditions.append("(genus ILIKE :search OR family ILIKE :search)")
         params_dict["search"] = f"%{params.search}%"
@@ -1370,7 +1647,7 @@ async def get_genera(
         conditions.append("family = :family_filter")
         params_dict["family_filter"] = params.family
 
-    # 记录数过滤
+    # Record count filter
     if params.record_count:
         if params.record_count == "high":
             conditions.append("record_count > 500")
@@ -1379,12 +1656,12 @@ async def get_genera(
         elif params.record_count == "low":
             conditions.append("record_count < 50")
 
-    # 构建WHERE子句
+    # Build WHERE clause
     where_clause = ""
     if conditions:
         where_clause = " WHERE " + " AND ".join(conditions)
 
-    # 排序
+    # Sort
     sort_mapping = {
         "records_desc": "record_count DESC",
         "species_desc": "species_count DESC",
@@ -1393,17 +1670,17 @@ async def get_genera(
     }
     order_by = sort_mapping.get(params.sort_by, "record_count DESC")
 
-    # 构建查询
+    # Build query
     data_query = text(base_select + where_clause + f" ORDER BY {order_by} LIMIT :limit OFFSET :offset")
     count_query = text(f"SELECT COUNT(*) FROM dbo.genus_stats{where_clause}")
 
-    # 执行查询
+    # Execute query
     params_dict.update({
         "limit": params.per_page,
         "offset": (params.page - 1) * params.per_page
     })
 
-    # 获取总数和数据
+    # Get total count and data
     total = db.execute(count_query, {k: v for k, v in params_dict.items() if k not in ['limit', 'offset']}).scalar()
     result = db.execute(data_query, params_dict).fetchall()
 
@@ -1433,7 +1710,7 @@ async def get_genera(
 
 @app.get("/api/genera/{genus_name}")
 async def get_genus_detail(genus_name: str, db: Session = Depends(get_db)):
-    """获取属详情"""
+    """Get genus details"""
     query = text("""
         SELECT genus, family, "order", species_count, record_count, 
                countries_count, institutions_count, georeferencing_quality, 
@@ -1468,7 +1745,7 @@ async def get_species(
         params: TaxonomyFilterParams = Depends(),
         db: Session = Depends(get_db)
 ):
-    """获取所有物种"""
+    """Get all species"""
     base_query = """
         SELECT CONCAT(genus, ' ', specificepithet) as scientific_name, scientificnameauthorship, vernacularname, 
                genus, family, "order", record_count, countries_count, 
@@ -1480,7 +1757,7 @@ async def get_species(
     conditions = []
     params_dict = {}
 
-    # 搜索条件
+    # Search conditions
     if params.search:
         conditions.append("""
             (specificepithet ILIKE :search OR vernacularname ILIKE :search 
@@ -1496,7 +1773,7 @@ async def get_species(
         conditions.append("genus = :genus_filter")
         params_dict["genus_filter"] = params.genus
 
-    # 记录数过滤
+    # Record count filter
     if params.record_count:
         if params.record_count == "high":
             conditions.append("record_count > 1000")
@@ -1505,7 +1782,7 @@ async def get_species(
         elif params.record_count == "low":
             conditions.append("record_count < 100")
 
-    # 数据质量过滤
+    # Data quality filter
     if params.data_quality:
         if params.data_quality == "excellent":
             conditions.append("georeferencing_quality > 95")
@@ -1514,13 +1791,13 @@ async def get_species(
         elif params.data_quality == "poor":
             conditions.append("georeferencing_quality < 80")
 
-    # 构建查询
+    # Build query
     if conditions:
         query = text(base_query + " WHERE " + " AND ".join(conditions))
     else:
         query = text(base_query)
 
-    # 排序
+    # Sort
     sort_mapping = {
         "records_desc": "record_count DESC",
         "name_asc": "scientific_name ASC",
@@ -1530,7 +1807,7 @@ async def get_species(
     order_by = sort_mapping.get(params.sort_by, "record_count DESC")
     query = text(str(query) + f" ORDER BY {order_by}")
 
-    # 总数
+    # Total count
     count_base = "SELECT COUNT(*) FROM dbo.species_stats"
     if conditions:
         count_query = text(count_base + " WHERE " + " AND ".join(conditions))
@@ -1538,7 +1815,7 @@ async def get_species(
         count_query = text(count_base)
     total = db.execute(count_query, params_dict).scalar()
 
-    # 分页
+    # Pagination
     query = text(str(query) + " LIMIT :limit OFFSET :offset")
     params_dict["limit"] = params.per_page
     params_dict["offset"] = (params.page - 1) * params.per_page
@@ -1573,9 +1850,9 @@ async def get_species(
 
 @app.get("/api/species/{scientific_name}")
 async def get_species_detail(scientific_name: str, db: Session = Depends(get_db)):
-    """获取物种详情 - 使用实时计算确保数据一致性"""
+    """Get species details - using real-time calculation to ensure data consistency"""
     
-    # 解析学名：支持 "Brycon henni" 或 "henni"
+    # Parse scientific name: supports "Brycon henni" or "henni"
     parts = scientific_name.strip().split(' ')
     if len(parts) >= 2:
         genus_name = parts[0]
@@ -1586,7 +1863,7 @@ async def get_species_detail(scientific_name: str, db: Session = Depends(get_db)
         genus_name = None
         use_full_name = False
     
-    # 实时统计查询
+    # Real-time statistics query
     stats_query = text("""
         SELECT 
             genus,
@@ -1623,7 +1900,7 @@ async def get_species_detail(scientific_name: str, db: Session = Depends(get_db)
     if not result:
         raise HTTPException(status_code=404, detail="Species not found")
 
-    # 构建完整学名
+    # Build full scientific name
     scientific_name_full = f"{result[0]} {result[1]}"
 
     return {
@@ -1650,7 +1927,7 @@ async def get_institutions(
         params: InstitutionFilterParams = Depends(),
         db: Session = Depends(get_db)
 ):
-    """获取所有机构 - 修复版本，每个机构只显示一次"""
+    """Get all institutions - fixed version, each institution shown only once"""
     base_select = """
         SELECT institutioncode, institution_name, ownerinstitutioncode, 
                country, region, institution_type, record_count, species_count, 
@@ -1663,7 +1940,7 @@ async def get_institutions(
     conditions = []
     params_dict = {}
 
-    # 搜索条件
+    # Search conditions
     if params.search:
         conditions.append("""
             (institutioncode ILIKE :search OR institution_name ILIKE :search 
@@ -1679,7 +1956,7 @@ async def get_institutions(
         conditions.append("institution_type = :type_filter")
         params_dict["type_filter"] = params.institution_type
 
-    # 记录数过滤
+    # Record count filter
     if params.record_count:
         if params.record_count == "major":
             conditions.append("record_count > 10000")
@@ -1688,12 +1965,12 @@ async def get_institutions(
         elif params.record_count == "small":
             conditions.append("record_count < 1000")
 
-    # 构建WHERE子句
+    # Build WHERE clause
     where_clause = ""
     if conditions:
         where_clause = " WHERE " + " AND ".join(conditions)
 
-    # 排序
+    # Sort
     sort_mapping = {
         "records_desc": "record_count DESC",
         "species_desc": "species_count DESC",
@@ -1702,17 +1979,17 @@ async def get_institutions(
     }
     order_by = sort_mapping.get(params.sort_by, "record_count DESC")
 
-    # 构建查询
+    # Build query
     data_query = text(base_select + where_clause + f" ORDER BY {order_by} LIMIT :limit OFFSET :offset")
     count_query = text(f"SELECT COUNT(*) FROM dbo.institution_stats{where_clause}")
 
-    # 执行查询
+    # Execute query
     params_dict.update({
         "limit": params.per_page,
         "offset": (params.page - 1) * params.per_page
     })
 
-    # 获取总数和数据
+    # Get total count and data
     total = db.execute(count_query, {k: v for k, v in params_dict.items() if k not in ['limit', 'offset']}).scalar()
     result = db.execute(data_query, params_dict).fetchall()
 
@@ -1749,7 +2026,7 @@ async def get_institutions(
 
 @app.get("/api/institutions/{institution_code}")
 async def get_institution_detail(institution_code: str, db: Session = Depends(get_db)):
-    """获取机构详情"""
+    """Get institution details"""
     query = text("""
         SELECT institutioncode, institution_name, ownerinstitutioncode, 
                region, institution_type, record_count, species_count, 
@@ -1790,7 +2067,7 @@ async def get_records(
         params: RecordFilterParams = Depends(),
         db: Session = Depends(get_db)
 ):
-    """获取记录"""
+    """Get records"""
     base_select = """
         SELECT catalognumber, scientificname, vernacularname, family, genus,
                scientificnameauthorship, recordedby, eventdate, country, 
@@ -1802,7 +2079,7 @@ async def get_records(
     conditions = []
     params_dict = {}
 
-    # 搜索条件
+    # Search conditions
     if params.search:
         conditions.append("""
             (scientificname ILIKE :search OR recordedby ILIKE :search 
@@ -1830,12 +2107,12 @@ async def get_records(
         conditions.append("genus = :genus_filter")
         params_dict["genus_filter"] = params.genus
 
-    # 构建WHERE子句
+    # Build WHERE clause
     where_clause = ""
     if conditions:
         where_clause = " WHERE " + " AND ".join(conditions)
 
-    # 排序
+    # Sort
     sort_mapping = {
         "date_desc": "eventdate DESC NULLS LAST",
         "date_asc": "eventdate ASC NULLS LAST",
@@ -1844,17 +2121,17 @@ async def get_records(
     }
     order_by = sort_mapping.get(params.sort_by, "eventdate DESC NULLS LAST")
 
-    # 构建查询
+    # Build query
     data_query = text(base_select + where_clause + f" ORDER BY {order_by} LIMIT :limit OFFSET :offset")
     count_query = text(f"SELECT COUNT(*) FROM dbo.record_details{where_clause}")
 
-    # 执行查询
+    # Execute query
     params_dict.update({
         "limit": params.per_page,
         "offset": (params.page - 1) * params.per_page
     })
 
-    # 获取总数和数据
+    # Get total count and data
     total = db.execute(count_query, {k: v for k, v in params_dict.items() if k not in ['limit', 'offset']}).scalar()
     result = db.execute(data_query, params_dict).fetchall()
 
@@ -1892,9 +2169,9 @@ async def get_records(
 
 @app.get("/api/taxonomy/stats")
 async def get_taxonomy_stats(db: Session = Depends(get_db)):
-    """获取分类统计 - 包含动态计算的指标"""
+    """Get taxonomy statistics - includes dynamically calculated metrics"""
 
-    # 1. 基础统计
+    # 1. Basic statistics
     basic_stats_query = text("""
         SELECT 
             COUNT(DISTINCT family) as total_families,
@@ -1911,7 +2188,7 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
 
     basic_result = db.execute(basic_stats_query).fetchone()
 
-    # 2. 高多样性家族计算 (>50个属的家族)
+    # 2. High diversity families (>50 genera per family)
     high_diversity_families_query = text("""
         SELECT COUNT(*) 
         FROM (
@@ -1925,7 +2202,7 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
 
     high_diversity_result = db.execute(high_diversity_families_query).scalar()
 
-    # 3. 良好采样家族计算 (>1000条记录的家族)
+    # 3. Well-sampled families (>1000 records per family)
     well_sampled_families_query = text("""
         SELECT COUNT(*) 
         FROM (
@@ -1939,7 +2216,7 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
 
     well_sampled_result = db.execute(well_sampled_families_query).scalar()
 
-    # 4. 全球覆盖家族计算 (在>20个国家有记录的家族)
+    # 4. Global coverage families (records in >20 countries)
     global_coverage_families_query = text("""
         SELECT COUNT(*) 
         FROM (
@@ -1953,7 +2230,7 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
 
     global_coverage_result = db.execute(global_coverage_families_query).scalar()
 
-    # 5. 物种丰富属计算 (>20个物种的属)
+    # 5. Species-rich genera (>20 species per genus)
     species_rich_genera_query = text("""
         SELECT COUNT(*) 
         FROM (
@@ -1967,7 +2244,7 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
 
     species_rich_genera_result = db.execute(species_rich_genera_query).scalar()
 
-    # 6. 良好采样属计算 (>500条记录的属)
+    # 6. Well-sampled genera (>500 records per genus)
     well_sampled_genera_query = text("""
         SELECT COUNT(*) 
         FROM (
@@ -1981,7 +2258,7 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
 
     well_sampled_genera_result = db.execute(well_sampled_genera_query).scalar()
 
-    # 7. 全球覆盖属计算 (在>15个国家有记录的属)
+    # 7. Global coverage genera (records in >15 countries)
     global_coverage_genera_query = text("""
         SELECT COUNT(*) 
         FROM (
@@ -1995,23 +2272,23 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
 
     global_coverage_genera_result = db.execute(global_coverage_genera_query).scalar()
 
-    # 8. 数据质量指标计算
+    # 8. Data quality metrics
     quality_stats_query = text("""
         SELECT 
-            -- 地理参考质量分布
+            -- Georeference quality distribution
             COUNT(CASE WHEN decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL THEN 1 END) * 100.0 / COUNT(*) as georef_percentage,
-            -- 时间数据质量
+            -- Temporal data quality
             COUNT(CASE WHEN eventdate IS NOT NULL AND eventdate != '' THEN 1 END) * 100.0 / COUNT(*) as date_percentage,
-            -- 分类学完整性
+            -- Taxonomic completeness
             COUNT(CASE WHEN specificepithet IS NOT NULL AND genus IS NOT NULL AND family IS NOT NULL THEN 1 END) * 100.0 / COUNT(*) as taxonomy_completeness,
-            -- 机构覆盖度
+            -- Institution coverage
             COUNT(CASE WHEN institutioncode IS NOT NULL AND institutioncode != '' THEN 1 END) * 100.0 / COUNT(*) as institution_coverage
         FROM dbo.harvestedfn2
     """)
 
     quality_result = db.execute(quality_stats_query).fetchone()
 
-    # 9. 近期活跃度 (最近5年有记录的家族数)
+    # 9. Recent activity (families with records in last 5 years)
     recent_activity_query = text("""
         SELECT COUNT(DISTINCT family)
         FROM dbo.harvestedfn2 
@@ -2024,7 +2301,7 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
 
     recent_families_result = db.execute(recent_activity_query).scalar()
 
-    # 10. 顶级贡献者统计
+    # 10. Top contributors statistics
     top_contributors_query = text("""
         SELECT 
             COUNT(CASE WHEN record_count > 10000 THEN 1 END) as major_families,
@@ -2040,9 +2317,9 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
 
     contributors_result = db.execute(top_contributors_query).fetchone()
 
-    # 组装完整的响应
+    # Assemble complete response
     return {
-        # 基础统计
+        # Basic statistics
         "totalFamilies": basic_result[0] or 0,
         "totalGenera": basic_result[1] or 0,
         "totalSpecies": basic_result[2] or 0,
@@ -2050,36 +2327,36 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
         "totalInstitutions": basic_result[4] or 0,
         "totalCountries": basic_result[5] or 0,
 
-        # 多样性指标
+        # Diversity metrics
         "highDiversityFamilies": high_diversity_result or 0,
         "wellSampledFamilies": well_sampled_result or 0,
         "globalCoverageFamilies": global_coverage_result or 0,
 
-        # 属级统计
+        # Genus-level statistics
         "speciesRichGenera": species_rich_genera_result or 0,
         "wellSampledGenera": well_sampled_genera_result or 0,
         "globalCoverageGenera": global_coverage_genera_result or 0,
 
-        # 质量指标
+        # Quality metrics
         "avgGeoreferencing": float(basic_result[6]) if basic_result[6] else 0.0,
         "avgDateQuality": float(basic_result[7]) if basic_result[7] else 0.0,
         "taxonomyCompleteness": float(quality_result[2]) if quality_result[2] else 0.0,
         "institutionCoverage": float(quality_result[3]) if quality_result[3] else 0.0,
 
-        # 活跃度指标
+        # Activity metrics
         "recentlyActiveFamilies": recent_families_result or 0,
 
-        # 贡献度分布
+        # Contribution distribution
         "majorContributorFamilies": contributors_result[0] or 0,
         "activeContributorFamilies": contributors_result[1] or 0,
         "underrepresentedFamilies": contributors_result[2] or 0,
 
-        # 计算时间戳
+        # Calculation timestamp
         "calculatedAt": datetime.now().isoformat()
     }
 
 
-# 在你的 main.py 中添加以下端点
+# Institution records endpoints
 
 @app.get("/api/institutions/{institution_code}/records", response_model=PaginatedResponse)
 async def get_institution_records(
@@ -2094,7 +2371,7 @@ async def get_institution_records(
         sort_by: str = "date_desc",
         db: Session = Depends(get_db)
 ):
-    """获取特定机构的所有记录"""
+    """Get all records for a specific institution"""
 
     base_select = """
         SELECT catalognumber, scientificname, vernacularname, family, genus,
@@ -2108,7 +2385,7 @@ async def get_institution_records(
     conditions = []
     params = {"institution_code": institution_code}
 
-    # 搜索条件
+    # Search conditions
     if search:
         conditions.append("""
             (scientificname ILIKE :search OR recordedby ILIKE :search 
@@ -2133,12 +2410,12 @@ async def get_institution_records(
         conditions.append("genus = :genus_filter")
         params["genus_filter"] = genus
 
-    # 构建WHERE子句
+    # Build WHERE clause
     where_clause = ""
     if conditions:
         where_clause = " AND " + " AND ".join(conditions)
 
-    # 排序
+    # Sort
     sort_mapping = {
         "date_desc": "eventdate DESC NULLS LAST",
         "date_asc": "eventdate ASC NULLS LAST",
@@ -2149,17 +2426,17 @@ async def get_institution_records(
     }
     order_by = sort_mapping.get(sort_by, "eventdate DESC NULLS LAST")
 
-    # 构建查询
+    # Build query
     data_query = text(base_select + where_clause + f" ORDER BY {order_by} LIMIT :limit OFFSET :offset")
     count_query = text(f"SELECT COUNT(*) FROM dbo.harvestedfn2 WHERE institutioncode = :institution_code{where_clause}")
 
-    # 执行查询
+    # Execute query
     params.update({
         "limit": per_page,
         "offset": (page - 1) * per_page
     })
 
-    # 获取总数和数据
+    # Get total count and data
     total = db.execute(count_query, {k: v for k, v in params.items() if k not in ['limit', 'offset']}).scalar()
     result = db.execute(data_query, params).fetchall()
 
@@ -2200,7 +2477,7 @@ async def get_institution_records_summary(
         institution_code: str,
         db: Session = Depends(get_db)
 ):
-    """获取机构记录的汇总统计信息"""
+    """Get summary statistics for institution records"""
 
     summary_query = text("""
         SELECT 
@@ -2224,7 +2501,7 @@ async def get_institution_records_summary(
     if not result:
         raise HTTPException(status_code=404, detail="Institution not found or has no records")
 
-    # 计算百分比
+    # Calculate percentages
     total = result[0]
     georef_percentage = round((result[6] / total) * 100, 1) if total > 0 else 0
     date_percentage = round((result[7] / total) * 100, 1) if total > 0 else 0
@@ -2254,9 +2531,9 @@ async def get_institution_records_filters(
         institution_code: str,
         db: Session = Depends(get_db)
 ):
-    """获取机构记录的过滤器选项"""
+    """Get filter options for institution records"""
 
-    # 获取可用的年份
+    # Get available years
     years_query = text("""
         SELECT DISTINCT "year"
         FROM dbo.harvestedfn2 
@@ -2265,7 +2542,7 @@ async def get_institution_records_filters(
         ORDER BY "year" DESC
     """)
 
-    # 获取可用的国家
+    # Get available countries
     countries_query = text("""
         SELECT DISTINCT country, COUNT(*) as record_count
         FROM dbo.harvestedfn2 
@@ -2275,7 +2552,7 @@ async def get_institution_records_filters(
         ORDER BY record_count DESC
     """)
 
-    # 获取可用的科
+    # Get available families
     families_query = text("""
         SELECT DISTINCT family, COUNT(*) as record_count
         FROM dbo.harvestedfn2 
@@ -2285,7 +2562,7 @@ async def get_institution_records_filters(
         ORDER BY record_count DESC
     """)
 
-    # 获取可用的属
+    # Get available genera
     genera_query = text("""
         SELECT DISTINCT genus, COUNT(*) as record_count
         FROM dbo.harvestedfn2 
@@ -2296,7 +2573,7 @@ async def get_institution_records_filters(
         LIMIT 100
     """)
 
-    # 获取可用的收藏代码
+    # Get available collection codes
     collections_query = text("""
         SELECT DISTINCT collectioncode, COUNT(*) as record_count
         FROM dbo.harvestedfn2 
@@ -2335,7 +2612,7 @@ async def export_institution_records(
         limit: int = Query(10000, le=50000),
         db: Session = Depends(get_db)
 ):
-    """导出机构记录数据"""
+    """Export institution records data"""
 
     base_select = """
         SELECT catalognumber, scientificname, vernacularname, family, genus,
@@ -2350,7 +2627,7 @@ async def export_institution_records(
     conditions = []
     params = {"institution_code": institution_code}
 
-    # 应用过滤条件
+    # Apply filter conditions
     if search:
         conditions.append("""
             (scientificname ILIKE :search OR recordedby ILIKE :search 
@@ -2374,7 +2651,7 @@ async def export_institution_records(
         conditions.append("genus = :genus_filter")
         params["genus_filter"] = genus
 
-    # 构建查询
+    # Build query
     where_clause = ""
     if conditions:
         where_clause = " AND " + " AND ".join(conditions)
@@ -2392,7 +2669,7 @@ async def export_institution_records(
         output = io.StringIO()
         writer = csv.writer(output)
 
-        # 写入表头
+        # Write header
         headers = [
             "catalogNumber", "scientificName", "vernacularName", "family", "genus",
             "scientificNameAuthorship", "recordedBy", "eventDate", "country",
@@ -2402,7 +2679,7 @@ async def export_institution_records(
         ]
         writer.writerow(headers)
 
-        # 写入数据
+        # Write data
         for row in result:
             writer.writerow(row)
 
@@ -2502,7 +2779,7 @@ async def export_institution_records(
         raise HTTPException(status_code=400, detail="Unsupported export format")
 
 
-# 另外，修改现有的 RecordsTable 组件使用的 API
+# RecordsTable component API
 @app.get("/api/records/by-institution/{institution_code}")
 async def get_records_by_institution(
         institution_code: str,
@@ -2510,7 +2787,7 @@ async def get_records_by_institution(
         per_page: int = Query(50, ge=1, le=200),
         db: Session = Depends(get_db)
 ):
-    """简化版本的机构记录获取，用于 RecordsTable 组件"""
+    """Simplified institution records fetch for RecordsTable component"""
 
     query = text("""
         SELECT catalognumber, scientificname, vernacularname, family, genus,
@@ -2561,9 +2838,9 @@ async def get_records_by_institution(
     }
 
 
-# 在你的 main.py 中添加这个端点
+# Institution records v2 endpoint
 
-# 在你的 main.py 的 get_records_by_institution_v2 函数中添加地理坐标过滤参数
+# Geo-coordinate filter parameters for get_records_by_institution_v2
 
 @app.get("/api/records/institution/{institution_code}", response_model=PaginatedResponse)
 async def get_records_by_institution_v2(
@@ -2576,10 +2853,10 @@ async def get_records_by_institution_v2(
         family: Optional[str] = None,
         genus: Optional[str] = None,
         sort_by: str = "date_desc",
-        georeferenced_only: bool = Query(False),  # 新增：只获取有地理坐标的记录
+        georeferenced_only: bool = Query(False),  # Only get records with geo-coordinates
         db: Session = Depends(get_db)
 ):
-    """按机构获取记录 - 适配前端现有API调用，支持地理坐标过滤"""
+    """Get records by institution - adapted for frontend API calls, supports geo-coordinate filtering"""
 
     base_select = """
         SELECT catalognumber, scientificname, vernacularname, family, genus,
@@ -2593,12 +2870,12 @@ async def get_records_by_institution_v2(
     conditions = []
     params = {"institution_code": institution_code}
 
-    # 地理坐标过滤
+    # Geo-coordinate filter
     if georeferenced_only:
         conditions.append("decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL")
-        conditions.append("decimallatitude != 0 OR decimallongitude != 0")  # 排除 0,0 坐标
+        conditions.append("decimallatitude != 0 OR decimallongitude != 0")  # Exclude 0,0 coordinates
 
-    # 其他搜索条件
+    # Other search conditions
     if search:
         conditions.append("""
             (scientificname ILIKE :search OR recordedby ILIKE :search 
@@ -2623,12 +2900,12 @@ async def get_records_by_institution_v2(
         conditions.append("genus = :genus_filter")
         params["genus_filter"] = genus
 
-    # 构建WHERE子句
+    # Build WHERE clause
     where_clause = ""
     if conditions:
         where_clause = " AND " + " AND ".join(conditions)
 
-    # 排序
+    # Sort
     sort_mapping = {
         "date_desc": "eventdate DESC NULLS LAST",
         "date_asc": "eventdate ASC NULLS LAST",
@@ -2639,17 +2916,17 @@ async def get_records_by_institution_v2(
     }
     order_by = sort_mapping.get(sort_by, "eventdate DESC NULLS LAST")
 
-    # 构建查询
+    # Build query
     data_query = text(base_select + where_clause + f" ORDER BY {order_by} LIMIT :limit OFFSET :offset")
     count_query = text(f"SELECT COUNT(*) FROM dbo.harvestedfn2 WHERE institutioncode = :institution_code{where_clause}")
 
-    # 执行查询
+    # Execute query
     params.update({
         "limit": per_page,
         "offset": (page - 1) * per_page
     })
 
-    # 获取总数和数据
+    # Get total count and data
     total = db.execute(count_query, {k: v for k, v in params.items() if k not in ['limit', 'offset']}).scalar()
     result = db.execute(data_query, params).fetchall()
 
@@ -2686,9 +2963,9 @@ async def get_records_by_institution_v2(
 
 @app.get("/api/institution/stats")
 async def get_institutions_stats(db: Session = Depends(get_db)):
-    """获取机构统计 - 修复版本"""
+    """Get institution statistics - fixed version"""
 
-    # 1. 基础统计 - 现在每个机构只计算一次
+    # 1. Basic statistics - each institution counted only once
     basic_stats_query = text("""
         SELECT 
             COUNT(*) as total_institutions,
@@ -2703,7 +2980,7 @@ async def get_institutions_stats(db: Session = Depends(get_db)):
 
     basic_result = db.execute(basic_stats_query).fetchone()
 
-    # 2. 贡献者分类统计
+    # 2. Contributor classification statistics
     contributors_query = text("""
         SELECT 
             COUNT(CASE WHEN record_count > 10000 THEN 1 END) as major_contributors,
@@ -2715,7 +2992,7 @@ async def get_institutions_stats(db: Session = Depends(get_db)):
 
     contributors_result = db.execute(contributors_query).fetchone()
 
-    # 3. 地理分布统计 - 修复版本
+    # 3. Geographic distribution statistics - fixed version
     geographic_distribution_query = text("""
         SELECT 
             COUNT(CASE WHEN region = 'North America' THEN 1 END) as north_america,
@@ -2729,7 +3006,7 @@ async def get_institutions_stats(db: Session = Depends(get_db)):
 
     geo_result = db.execute(geographic_distribution_query).fetchone()
 
-    # # 4. 收藏多样性统计
+    # # 4. Collection diversity statistics
     # collection_diversity_query = text("""
     #     SELECT
     #         COUNT(CASE WHEN collection_codes IS NOT NULL THEN 1 END) as institutions_with_collections,
@@ -2742,7 +3019,7 @@ async def get_institutions_stats(db: Session = Depends(get_db)):
 
     # collection_result = db.execute(collection_diversity_query).fetchone()
 
-    # 5. 时间覆盖分析 - 安全处理NULL值
+    # 5. Temporal coverage analysis - safely handle NULL values
     temporal_coverage_query = text("""
         SELECT 
             COALESCE(SUM(CASE WHEN latest_year >= 2020 THEN record_count ELSE 0 END), 0) as recent_records,
@@ -2756,7 +3033,7 @@ async def get_institutions_stats(db: Session = Depends(get_db)):
     temporal_result = db.execute(temporal_coverage_query).fetchone()
 
     return {
-        # 基础统计
+        # Basic statistics
         "totalInstitutions": basic_result[0] or 0,
         "totalCollectionCodes": basic_result[1] or 0,
         "totalRecords": basic_result[2] or 0,
@@ -2764,13 +3041,13 @@ async def get_institutions_stats(db: Session = Depends(get_db)):
         "avgGeoreferenced": float(basic_result[4]) if basic_result[4] else 0.0,
         "avgDateQuality": float(basic_result[5]) if basic_result[5] else 0.0,
 
-        # 贡献者分类
+        # Contributor classification
         "majorContributors": contributors_result[0] or 0,
         "activeContributors": contributors_result[1] or 0,
         "researchCollections": contributors_result[2] or 0,
         "highQualityData": contributors_result[3] or 0,
 
-        # 地理分布
+        # Geographic distribution
         "northAmericaInstitutions": geo_result[0] or 0,
         "europeInstitutions": geo_result[1] or 0,
         "asiaPacificInstitutions": geo_result[2] or 0,
@@ -2778,25 +3055,25 @@ async def get_institutions_stats(db: Session = Depends(get_db)):
         "africaInstitutions": geo_result[4] or 0,
         "otherRegionsInstitutions": geo_result[5] or 0,
 
-        # # 收藏多样性
+        # # Collection diversity
         # "institutionsWithCollections": collection_result[0] or 0,
         # "uniqueCollectionCodes": collection_result[1] or 0,
         # "avgCollectionsPerInstitution": float(collection_result[2]) if collection_result[2] else 0.0,
 
-        # 时间覆盖
+        # Temporal coverage
         "recentRecords": temporal_result[0] or 0,
         "decadeRecords": temporal_result[1] or 0,
         "millenniumRecords": temporal_result[2] or 0,
         "historicalRecords": temporal_result[3] or 0,
 
-        # 计算时间戳
+        # Calculation timestamp
         "calculatedAt": datetime.now().isoformat()
     }
 
 
 @app.get("/api/institutions/{institution_code}/countries")
 async def get_institution_countries(institution_code: str, db: Session = Depends(get_db)):
-    """获取特定机构在各国的分布情况"""
+    """Get institution distribution by country"""
     query = text("""
         SELECT country, records_in_country, species_in_country, percentage_of_records
         FROM dbo.institution_country_distribution
@@ -2820,7 +3097,7 @@ async def get_institution_countries(institution_code: str, db: Session = Depends
 
 @app.get("/api/orders")
 async def get_orders(db: Session = Depends(get_db)):
-    """获取所有目"""
+    """Get all orders"""
     query = text("""
         SELECT "order", COUNT(DISTINCT family) as family_count, 
                COUNT(DISTINCT scientificname) as species_count
@@ -2851,7 +3128,7 @@ async def get_records_by_taxon(
         has_coordinates: Optional[bool] = Query(None, description="Filter records with coordinates"),
         db: Session = Depends(get_db)
 ):
-    """根据分类单元获取记录"""
+    """Get records by taxonomic unit"""
     field_mapping = {
         "family": "family",
         "genus": "genus",
@@ -2922,7 +3199,7 @@ async def get_records_by_taxon(
     )
 
 
-# 在 main.py 中添加以下端点
+# Taxonomy hierarchy endpoints
 
 @app.get("/api/families/{family_name}/children")
 async def get_family_children(
@@ -2933,9 +3210,9 @@ async def get_family_children(
         sort_by: str = "records_desc",
         db: Session = Depends(get_db)
 ):
-    """获取科下的所有属"""
+    """Get all genera under a family"""
 
-    # 构建基础查询
+    # Build base query
     base_query = """
         SELECT genus, COUNT(DISTINCT specificepithet) as species_count,
                COUNT(*) as record_count, COUNT(DISTINCT country) as countries_count,
@@ -2957,7 +3234,7 @@ async def get_family_children(
 
     group_clause = " GROUP BY genus"
 
-    # 排序
+    # Sort
     sort_mapping = {
         "records_desc": "record_count DESC",
         "species_desc": "species_count DESC",
@@ -2966,7 +3243,7 @@ async def get_family_children(
     }
     order_clause = f" ORDER BY {sort_mapping.get(sort_by, 'record_count DESC')}"
 
-    # 构建完整查询
+    # Build complete query
     where_clause = ""
     if conditions:
         where_clause = " AND " + " AND ".join(conditions)
@@ -2975,7 +3252,7 @@ async def get_family_children(
     count_query = text(
         f"SELECT COUNT(DISTINCT genus) FROM dbo.harvestedfn2 WHERE family = :family_name AND genus IS NOT NULL AND genus != ''{where_clause}")
 
-    # 执行查询
+    # Execute query
     params.update({
         "limit": per_page,
         "offset": (page - 1) * per_page
@@ -3014,7 +3291,7 @@ async def get_genus_children(
         sort_by: str = "records_desc",
         db: Session = Depends(get_db)
 ):
-    """获取属下的所有物种"""
+    """Get all species under a genus"""
 
     base_query = """
         SELECT scientificname, vernacularname, COUNT(*) as record_count,
@@ -3037,7 +3314,7 @@ async def get_genus_children(
 
     group_clause = " GROUP BY scientificname, vernacularname"
 
-    # 排序
+    # Sort
     sort_mapping = {
         "records_desc": "record_count DESC",
         "name_asc": "scientificname ASC",
@@ -3088,13 +3365,13 @@ async def get_taxon_diversity(
         taxon_name: str,
         db: Session = Depends(get_db)
 ):
-    """获取分类单元的多样性统计"""
+    """Get diversity statistics for taxonomic unit"""
 
     if taxon_type not in ["family", "genus", "species"]:
         raise HTTPException(status_code=400, detail="Invalid taxon type")
 
     if taxon_type == "family":
-        # 科的多样性 - 按属统计
+        # Family diversity - statistics by genus
         query = text("""
             SELECT genus, COUNT(DISTINCT specificepithet) as species_count,
                    COUNT(*) as record_count
@@ -3105,7 +3382,7 @@ async def get_taxon_diversity(
             LIMIT 10
         """)
     elif taxon_type == "genus":
-        # 属的多样性 - 按物种统计
+        # Genus diversity - statistics by species
         query = text("""
             SELECT scientificname, COUNT(*) as record_count,
                    MAX(vernacularname) as vernacular_name
@@ -3116,7 +3393,7 @@ async def get_taxon_diversity(
             LIMIT 10
         """)
     else:
-        # 物种层级不需要多样性统计
+        # Species level doesn't need diversity statistics
         return {"diversityData": []}
 
     result = db.execute(query, {"taxon_name": taxon_name}).fetchall()
@@ -3145,7 +3422,7 @@ async def get_taxon_geographic_distribution(
         taxon_name: str,
         db: Session = Depends(get_db)
 ):
-    """获取分类单元的地理分布统计"""
+    """Get geographic distribution statistics for taxonomic unit"""
 
     if taxon_type not in ["family", "genus", "species"]:
         raise HTTPException(status_code=400, detail="Invalid taxon type")
@@ -3153,7 +3430,7 @@ async def get_taxon_geographic_distribution(
     field_mapping = {"family": "family", "genus": "genus", "species": "specificepithet"}
     field = field_mapping[taxon_type]
 
-    # 1. 大陆分布统计
+    # 1. Continental distribution statistics
     continent_query = text(f"""
         SELECT 
             CASE 
@@ -3182,7 +3459,7 @@ async def get_taxon_geographic_distribution(
 
     continent_result = db.execute(continent_query, {"taxon_name": taxon_name}).fetchall()
 
-    # 2. 国家分布统计
+    # 2. Country distribution statistics
     country_query = text(f"""
         SELECT country, COUNT(*) as records,
                COUNT(DISTINCT CASE WHEN {field} = :taxon_name THEN scientificname END) as species_count,
@@ -3198,7 +3475,7 @@ async def get_taxon_geographic_distribution(
 
     country_result = db.execute(country_query, {"taxon_name": taxon_name}).fetchall()
 
-    # 3. 生物多样性热点
+    # 3. Biodiversity hotspots
     hotspot_query = text(f"""
         SELECT country, COUNT(*) as records,
                COUNT(DISTINCT scientificname) as species_count,
@@ -3209,7 +3486,7 @@ async def get_taxon_geographic_distribution(
         FROM dbo.harvestedfn2 
         WHERE {field} = :taxon_name AND country IS NOT NULL AND country != ''
         GROUP BY country
-        HAVING COUNT(*) > 100  -- 只显示有足够记录的地区
+        HAVING COUNT(*) > 100  -- Only show regions with sufficient records
         ORDER BY species_count DESC, records DESC
         LIMIT 8
     """)
@@ -3251,7 +3528,7 @@ async def get_taxon_geographic_distribution(
     }
 
 
-# 修复 temporal patterns 查询中的 SQL 语法错误
+# Fix SQL syntax error in temporal patterns query
 
 @app.get("/api/{taxon_type}/{taxon_name}/temporal")
 async def get_taxon_temporal_patterns(
@@ -3259,7 +3536,7 @@ async def get_taxon_temporal_patterns(
         taxon_name: str,
         db: Session = Depends(get_db)
 ):
-    """获取分类单元的时间模式统计"""
+    """Get temporal pattern statistics for taxonomic unit"""
 
     if taxon_type not in ["family", "genus", "species"]:
         raise HTTPException(status_code=400, detail="Invalid taxon type")
@@ -3267,7 +3544,7 @@ async def get_taxon_temporal_patterns(
     field_mapping = {"family": "family", "genus": "genus", "species": "specificepithet"}
     field = field_mapping[taxon_type]
 
-    # 1. 历史时期统计
+    # 1. Historical period statistics
     historical_query = text(f"""
         WITH period_data AS (
             SELECT 
@@ -3305,7 +3582,7 @@ async def get_taxon_temporal_patterns(
             END
     """)
 
-    # 2. 季节性模式
+    # 2. Seasonal patterns
     seasonal_query = text(f"""
         WITH seasonal_data AS (
             SELECT 
@@ -3333,7 +3610,7 @@ async def get_taxon_temporal_patterns(
         ORDER BY records DESC
     """)
 
-    # 3. 近期活动
+    # 3. Recent activity
     recent_query = text(f"""
         SELECT year, COUNT(*) as records
         FROM dbo.harvestedfn2 
@@ -3342,7 +3619,7 @@ async def get_taxon_temporal_patterns(
         ORDER BY year DESC
     """)
 
-    # 4. 年度趋势数据（用于时间线图表）
+    # 4. Annual trend data (for timeline charts)
     yearly_trend_query = text(f"""
         SELECT year, COUNT(*) as records
         FROM dbo.harvestedfn2 
@@ -3353,7 +3630,7 @@ async def get_taxon_temporal_patterns(
         ORDER BY year
     """)
 
-    # 5. 月度分布
+    # 5. Monthly distribution
     monthly_distribution_query = text(f"""
         SELECT month, COUNT(*) as records
         FROM dbo.harvestedfn2 
@@ -3362,7 +3639,7 @@ async def get_taxon_temporal_patterns(
         ORDER BY month
     """)
 
-    # 6. 数据覆盖率
+    # 6. Data coverage
     data_coverage_query = text(f"""
         SELECT 
             COUNT(*) as total_records,
@@ -3374,7 +3651,7 @@ async def get_taxon_temporal_patterns(
     """)
 
     try:
-        # 执行查询
+        # Execute query
         historical_result = db.execute(historical_query, {"taxon_name": taxon_name}).fetchall()
         seasonal_result = db.execute(seasonal_query, {"taxon_name": taxon_name}).fetchall()
         recent_result = db.execute(recent_query, {"taxon_name": taxon_name}).fetchall()
@@ -3382,7 +3659,7 @@ async def get_taxon_temporal_patterns(
         monthly_result = db.execute(monthly_distribution_query, {"taxon_name": taxon_name}).fetchall()
         coverage_result = db.execute(data_coverage_query, {"taxon_name": taxon_name}).fetchone()
 
-        # 处理结果
+        # Process results
         historical_periods = []
         for row in historical_result:
             historical_periods.append({
@@ -3405,7 +3682,7 @@ async def get_taxon_temporal_patterns(
                 "records": row[1]
             })
 
-        # 年度趋势数据（用于图表）
+        # Annual trend data (for charts)
         yearly_trend = []
         for row in yearly_trend_result:
             yearly_trend.append({
@@ -3413,7 +3690,7 @@ async def get_taxon_temporal_patterns(
                 "records": row[1]
             })
 
-        # 月度分布数据
+        # Monthly distribution data
         monthly_distribution = []
         month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
                        'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -3424,7 +3701,7 @@ async def get_taxon_temporal_patterns(
                 "records": row[1]
             })
 
-        # 数据覆盖率
+        # Data coverage
         data_coverage = {
             "totalRecords": coverage_result[0] if coverage_result else 0,
             "recordsWithYear": coverage_result[1] if coverage_result else 0,
@@ -3458,7 +3735,7 @@ async def get_taxon_temporal_patterns(
 
     except Exception as e:
         print(f"Error in temporal query: {str(e)}")
-        # 返回空结果而不是抛出异常
+        # Return empty result instead of throwing exception
         return {
             "historicalPeriods": [],
             "seasonalPatterns": [],
@@ -3470,7 +3747,7 @@ async def get_taxon_temporal_patterns(
         }
 
 
-# 3. 修改机构API，确保返回地图所需的数据
+# 3. Institution API modification - ensure map-required data is returned
 @app.get("/api/{taxon_type}/{taxon_name}/institutions")
 async def get_taxon_institutions(
         taxon_type: str,
@@ -3481,7 +3758,7 @@ async def get_taxon_institutions(
         sort_by: str = "records_desc",
         db: Session = Depends(get_db)
 ):
-    """获取分类单元的贡献机构统计"""
+    """Get contributing institution statistics for taxonomic unit"""
 
     if taxon_type not in ["family", "genus", "species"]:
         raise HTTPException(status_code=400, detail="Invalid taxon type")
@@ -3502,7 +3779,7 @@ async def get_taxon_institutions(
                FILTER (WHERE collectioncode IS NOT NULL AND collectioncode != '') as collection_codes,
                MAX(eventdate) as latest_record,
                ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) as percentage,
-               -- 添加国家信息用于地图显示
+               -- Add country info for map display
                (array_agg(DISTINCT country ORDER BY country))[1] as primary_country
         FROM dbo.harvestedfn2 
         WHERE {field} = :taxon_name AND institutioncode IS NOT NULL AND institutioncode != ''
@@ -3517,7 +3794,7 @@ async def get_taxon_institutions(
 
     group_clause = " GROUP BY institutioncode"
 
-    # 排序
+    # Sort
     sort_mapping = {
         "records_desc": "record_count DESC",
         "species_desc": "species_count DESC",
@@ -3544,7 +3821,7 @@ async def get_taxon_institutions(
 
     institutions = []
     for row in result:
-        # 机构名称映射
+        # Institution name mapping
         institution_name = {
             'NMNH': 'National Museum of Natural History',
             'AMNH': 'American Museum of Natural History',
@@ -3565,7 +3842,7 @@ async def get_taxon_institutions(
             "collectionCodes": row[6] if row[6] else [],
             "latestRecord": row[7],
             "percentage": float(row[8]) if row[8] else 0.0,
-            "country": row[9] or 'Unknown'  # 用于地图显示
+            "country": row[9] or 'Unknown'  # For map display
         })
 
     return {
@@ -3577,14 +3854,14 @@ async def get_taxon_institutions(
     }
 
 
-# 4. 添加一个专门用于地图数据的端点
+# 4. Map data endpoint
 @app.get("/api/{taxon_type}/{taxon_name}/map-data")
 async def get_taxon_map_data(
         taxon_type: str,
         taxon_name: str,
         db: Session = Depends(get_db)
 ):
-    """获取用于地图显示的机构分布数据"""
+    """Get institution distribution data for map display"""
 
     if taxon_type not in ["family", "genus", "species"]:
         raise HTTPException(status_code=400, detail="Invalid taxon type")
@@ -3592,7 +3869,7 @@ async def get_taxon_map_data(
     field_mapping = {"family": "family", "genus": "genus", "species": "specificepithet"}
     field = field_mapping[taxon_type]
 
-    # 获取按国家分组的机构数据
+    # Get institution data grouped by country
     query = text(f"""
         SELECT 
             country,
@@ -3604,14 +3881,14 @@ async def get_taxon_map_data(
           AND country IS NOT NULL AND country != ''
           AND institutioncode IS NOT NULL AND institutioncode != ''
         GROUP BY country
-        HAVING COUNT(*) > 10  -- 只显示有足够记录的国家
+        HAVING COUNT(*) > 10  -- Only show countries with sufficient records
         ORDER BY total_records DESC
         LIMIT 50
     """)
 
     result = db.execute(query, {"taxon_name": taxon_name}).fetchall()
 
-    # 国家坐标映射（实际应用中可以使用地理编码服务）
+    # Country coordinate mapping (in production, use geocoding service)
     country_coords = {
         'United States': {'lat': 39.8283, 'lng': -98.5795},
         'USA': {'lat': 39.8283, 'lng': -98.5795},
@@ -3676,11 +3953,11 @@ async def get_taxon_map_data(
         coords = country_coords.get(country)
 
         if coords:
-            # 为每个国家创建一个虚拟的"机构聚合点"
+            # Create a virtual "institution aggregation point" for each country
             map_data.append({
                 'institutionCode': f"AGG_{country.upper().replace(' ', '_')}",
                 'institutionName': f"{country} Institutions",
-                'lat': coords['lat'] + (hash(country) % 100 - 50) * 0.01,  # 添加小的随机偏移避免重叠
+                'lat': coords['lat'] + (hash(country) % 100 - 50) * 0.01,  # Add small random offset to avoid overlap
                 'lng': coords['lng'] + (hash(country) % 100 - 50) * 0.01,
                 'recordCount': row[2],  # total_records
                 'country': country,
@@ -3698,7 +3975,7 @@ async def get_taxon_top_species(
         limit: int = Query(8, ge=1, le=20),
         db: Session = Depends(get_db)
 ):
-    """获取分类单元下记录最多的物种"""
+    """Get species with most records under taxonomic unit"""
 
     if taxon_type not in ["family", "genus"]:
         raise HTTPException(status_code=400, detail="Only family and genus support top species")
@@ -3739,7 +4016,7 @@ async def get_taxon_hierarchy(
         taxon_name: str,
         db: Session = Depends(get_db)
 ):
-    """获取分类单元的层级信息"""
+    """Get hierarchy information for taxonomic unit"""
 
     if taxon_type not in ["family", "genus", "species"]:
         raise HTTPException(status_code=400, detail="Invalid taxon type")
@@ -3778,7 +4055,7 @@ async def get_taxon_hierarchy(
     }
 
 
-# 在 main.py 中添加以下端点
+# Taxonomy hierarchy endpoints
 
 @app.get("/api/{taxon_type}/{taxon_name}/institution-coverage")
 async def get_taxon_institution_coverage(
@@ -3786,7 +4063,7 @@ async def get_taxon_institution_coverage(
         taxon_name: str,
         db: Session = Depends(get_db)
 ):
-    """获取特定分类单元的机构覆盖度分析 - 动态计算"""
+    """Get institution coverage analysis for taxonomic unit - dynamically calculated"""
 
     if taxon_type not in ["family", "genus", "species"]:
         raise HTTPException(status_code=400, detail="Invalid taxon type")
@@ -3795,7 +4072,7 @@ async def get_taxon_institution_coverage(
     field = field_mapping[taxon_type]
 
     try:
-        # 1. 地理覆盖度分析
+        # 1. Geographic coverage analysis
         geographic_coverage_query = text(f"""
             WITH institution_countries AS (
                 SELECT institutioncode, 
@@ -3817,7 +4094,7 @@ async def get_taxon_institution_coverage(
 
         geographic_result = db.execute(geographic_coverage_query, {"taxon_name": taxon_name}).fetchone()
 
-        # 2. 分类专业化分析
+        # 2. Taxonomic specialization analysis
         taxonomic_specialization_query = text(f"""
             WITH institution_taxonomy AS (
                 SELECT institutioncode,
@@ -3840,7 +4117,7 @@ async def get_taxon_institution_coverage(
 
         taxonomic_result = db.execute(taxonomic_specialization_query, {"taxon_name": taxon_name}).fetchone()
 
-        # 3. 数据质量分析
+        # 3. Data quality analysis
         data_quality_query = text(f"""
             WITH institution_quality AS (
                 SELECT institutioncode,
@@ -3879,7 +4156,7 @@ async def get_taxon_institution_coverage(
 
         quality_result = db.execute(data_quality_query, {"taxon_name": taxon_name}).fetchone()
 
-        # 4. 收藏规模分析
+        # 4. Collection size analysis
         collection_scale_query = text(f"""
             WITH institution_scale AS (
                 SELECT institutioncode,
@@ -3902,7 +4179,7 @@ async def get_taxon_institution_coverage(
 
         scale_result = db.execute(collection_scale_query, {"taxon_name": taxon_name}).fetchone()
 
-        # 5. 机构类型分析（基于机构代码模式）
+        # 5. Institution type analysis (based on institution code patterns)
         institution_type_query = text(f"""
             WITH institution_types AS (
                 SELECT institutioncode,
@@ -3931,7 +4208,7 @@ async def get_taxon_institution_coverage(
 
         type_result = db.execute(institution_type_query, {"taxon_name": taxon_name}).fetchall()
 
-        # 6. 时间活跃度分析
+        # 6. Temporal activity analysis
         temporal_activity_query = text(f"""
             WITH institution_activity AS (
                 SELECT institutioncode,
@@ -3957,7 +4234,7 @@ async def get_taxon_institution_coverage(
 
         activity_result = db.execute(temporal_activity_query, {"taxon_name": taxon_name}).fetchone()
 
-        # 组装结果
+        # Assemble results
         institution_types_breakdown = {}
         for row in type_result:
             institution_types_breakdown[row[0]] = {
@@ -4006,7 +4283,7 @@ async def get_taxon_institution_coverage(
 
     except Exception as e:
         print(f"Error in institution coverage analysis: {str(e)}")
-        # 返回默认值而不是抛出异常
+        # Return default values instead of throwing exception
         return {
             "geographicCoverage": {
                 "globalCoverage": 0,
