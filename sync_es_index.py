@@ -19,6 +19,16 @@ from elasticsearch.helpers import bulk
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from config import settings
+print('ES_URL:', settings.ES_URL)
+print('ES_USER:', settings.ES_USER)
+from elasticsearch import Elasticsearch
+from config import settings
+
+es = Elasticsearch(
+    settings.ES_URL,
+    basic_auth=(settings.ES_USER, settings.ES_PASSWORD),
+    verify_certs=False
+)
 
 # ES client
 # Use basic_auth if ES_USER and ES_PASSWORD are configured
@@ -183,19 +193,11 @@ def text_keyword_field():
     return {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}}
 
 
-# text+keyword definition with phonetic subfield (for species name search)
+# text+keyword definition (phonetic disabled - requires analysis-phonetic plugin)
+# To enable phonetic search later, install plugin and restore phonetic subfield
 def text_keyword_phonetic_field():
-    return {
-        "type": "text",
-        "analyzer": "standard",
-        "fields": {
-            "keyword": {"type": "keyword", "ignore_above": 256},
-            "phonetic": {
-                "type": "text",
-                "analyzer": "phonetic_analyzer"
-            }
-        }
-    }
+    # Phonetic disabled - fallback to standard text+keyword
+    return {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}}
 
 
 # ES Index Mapping definition
@@ -207,23 +209,9 @@ INDEX_MAPPING = {
         "number_of_replicas": 0,
         "index": {
             "max_result_window": 100000
-        },
-        "analysis": {
-            "filter": {
-                "phonetic_filter": {
-                    "type": "phonetic",
-                    "encoder": "double_metaphone",
-                    "replace": False
-                }
-            },
-            "analyzer": {
-                "phonetic_analyzer": {
-                    "type": "custom",
-                    "tokenizer": "standard",
-                    "filter": ["lowercase", "phonetic_filter"]
-                }
-            }
         }
+        # Phonetic analyzer disabled - requires analysis-phonetic plugin
+        # To enable: install plugin and add analysis config here
     },
     "mappings": {
         "properties": {
