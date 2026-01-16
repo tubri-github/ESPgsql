@@ -21,7 +21,7 @@ from sqlalchemy.orm import sessionmaker
 from config import settings
 
 # ES client
-es = Elasticsearch(settings.ES_URL)
+es = Elasticsearch(settings.ES_URL, verify_certs=False)
 
 # harvestedfn2 database connection
 engine = create_engine(settings.DATABASE_URL)
