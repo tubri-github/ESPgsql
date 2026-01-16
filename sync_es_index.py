@@ -193,11 +193,19 @@ def text_keyword_field():
     return {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}}
 
 
-# text+keyword definition (phonetic disabled - requires analysis-phonetic plugin)
-# To enable phonetic search later, install plugin and restore phonetic subfield
+# text+keyword definition with phonetic subfield (for species name search)
 def text_keyword_phonetic_field():
-    # Phonetic disabled - fallback to standard text+keyword
-    return {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}}
+    return {
+        "type": "text",
+        "analyzer": "standard",
+        "fields": {
+            "keyword": {"type": "keyword", "ignore_above": 256},
+            "phonetic": {
+                "type": "text",
+                "analyzer": "phonetic_analyzer"
+            }
+        }
+    }
 
 
 # ES Index Mapping definition
@@ -209,9 +217,23 @@ INDEX_MAPPING = {
         "number_of_replicas": 0,
         "index": {
             "max_result_window": 100000
+        },
+        "analysis": {
+            "filter": {
+                "phonetic_filter": {
+                    "type": "phonetic",
+                    "encoder": "double_metaphone",
+                    "replace": False
+                }
+            },
+            "analyzer": {
+                "phonetic_analyzer": {
+                    "type": "custom",
+                    "tokenizer": "standard",
+                    "filter": ["lowercase", "phonetic_filter"]
+                }
+            }
         }
-        # Phonetic analyzer disabled - requires analysis-phonetic plugin
-        # To enable: install plugin and add analysis config here
     },
     "mappings": {
         "properties": {
