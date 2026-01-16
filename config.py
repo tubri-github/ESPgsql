@@ -45,6 +45,8 @@ class Config(BaseSettings):
 
     # Elasticsearch
     ES_URL: str = os.getenv('ES_URL', 'http://localhost:9200')
+    ES_USER: str = os.getenv('ES_USER', '')
+    ES_PASSWORD: str = os.getenv('ES_PASSWORD', '')
     # ES_INDEX: str = os.getenv('ES_INDEX', 'mrservice_full_index')
     ES_INDEX: str = os.getenv('ES_INDEX', 'mrservice_harvestedfn2_index')
 

@@ -21,7 +21,15 @@ from sqlalchemy.orm import sessionmaker
 from config import settings
 
 # ES client
-es = Elasticsearch(settings.ES_URL, verify_certs=False)
+# Use basic_auth if ES_USER and ES_PASSWORD are configured
+if settings.ES_USER and settings.ES_PASSWORD:
+    es = Elasticsearch(
+        settings.ES_URL,
+        basic_auth=(settings.ES_USER, settings.ES_PASSWORD),
+        verify_certs=False
+    )
+else:
+    es = Elasticsearch(settings.ES_URL, verify_certs=False)
 
 # harvestedfn2 database connection
 engine = create_engine(settings.DATABASE_URL)
