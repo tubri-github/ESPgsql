@@ -1120,7 +1120,7 @@ async def adsearch(payload: SearchPayload):
                     "cardinality": {"field": "InstitutionCode.keyword"}
                 },
                 "unique_countries": {
-                    "cardinality": {"field": "Country.keyword"}
+                    "cardinality": {"field": "CountryCode.keyword"}
                 }
             }
         }
@@ -1858,8 +1858,8 @@ async def get_species(
 
 @app.get("/species/{scientific_name}")
 async def get_species_detail(scientific_name: str, db: Session = Depends(get_db)):
-    """Get species details - using real-time calculation to ensure data consistency"""
-    
+    """Get species details - uses species_stats cache table"""
+
     # Parse scientific name: supports "Brycon henni" or "henni"
     parts = scientific_name.strip().split(' ')
     if len(parts) >= 2:
@@ -1870,45 +1870,32 @@ async def get_species_detail(scientific_name: str, db: Session = Depends(get_db)
         specific_epithet = scientific_name
         genus_name = None
         use_full_name = False
-    
-    # Real-time statistics query
-    stats_query = text("""
-        SELECT 
-            genus,
-            specificepithet,
-            scientificnameauthorship,
-            vernacularname,
-            family,
-            "order",
-            COUNT(*) as record_count,
-            COUNT(DISTINCT country) as countries_count,
-            COUNT(DISTINCT institutioncode) as institutions_count,
-            ROUND(
-                COUNT(CASE WHEN decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL THEN 1 END) * 100.0 / COUNT(*), 1
-            ) as georeferencing_quality,
-            ROUND(
-                COUNT(CASE WHEN eventdate IS NOT NULL THEN 1 END) * 100.0 / COUNT(*), 1
-            ) as date_quality,
-            MAX(eventdate) as last_record,
-            NOW() as last_updated
-        FROM dbo.harvestedfn2 
-        WHERE specificepithet = :specific_epithet
-        """ + (" AND genus = :genus_name" if use_full_name else "") + """
-          AND institutioncode IS NOT NULL 
-          AND institutioncode != ''
-        GROUP BY genus, specificepithet, scientificnameauthorship, vernacularname, family, "order"
-    """)
-    
-    params = {"specific_epithet": specific_epithet}
+
+    # Query from species_stats cache table
     if use_full_name:
-        params["genus_name"] = genus_name
+        stats_query = text("""
+            SELECT genus, specificepithet, scientificnameauthorship, vernacularname,
+                   family, "order", record_count, countries_count, institutions_count,
+                   georeferencing_quality, date_quality, last_record, last_updated
+            FROM dbo.species_stats
+            WHERE genus = :genus_name AND specificepithet = :specific_epithet
+        """)
+        params = {"genus_name": genus_name, "specific_epithet": specific_epithet}
+    else:
+        stats_query = text("""
+            SELECT genus, specificepithet, scientificnameauthorship, vernacularname,
+                   family, "order", record_count, countries_count, institutions_count,
+                   georeferencing_quality, date_quality, last_record, last_updated
+            FROM dbo.species_stats
+            WHERE specificepithet = :specific_epithet
+        """)
+        params = {"specific_epithet": specific_epithet}
 
     result = db.execute(stats_query, params).fetchone()
 
     if not result:
         raise HTTPException(status_code=404, detail="Species not found")
 
-    # Build full scientific name
     scientific_name_full = f"{result[0]} {result[1]}"
 
     return {
@@ -1918,9 +1905,9 @@ async def get_species_detail(scientific_name: str, db: Session = Depends(get_db)
         "genus": result[0],
         "family": result[4],
         "order": result[5],
-        "recordCount": result[6],
-        "countriesCount": result[7],
-        "institutionsCount": result[8],
+        "recordCount": result[6] or 0,
+        "countriesCount": result[7] or 0,
+        "institutionsCount": result[8] or 0,
         "geoReferencingQuality": float(result[9]) if result[9] else 0.0,
         "dateQuality": float(result[10]) if result[10] else 0.0,
         "lastRecord": result[11],
@@ -2177,187 +2164,92 @@ async def get_records(
 
 @app.get("/taxonomy/stats")
 async def get_taxonomy_stats(db: Session = Depends(get_db)):
-    """Get taxonomy statistics - includes dynamically calculated metrics"""
+    """Get taxonomy statistics - uses cache tables for performance, raw table only for quality metrics"""
 
-    # 1. Basic statistics
-    basic_stats_query = text("""
-        SELECT 
-            COUNT(DISTINCT family) as total_families,
-            COUNT(DISTINCT genus) as total_genera,
-            COUNT(DISTINCT  trim(specificepithet)) as total_species,
-            COUNT(*) as total_records,
-            COUNT(DISTINCT institutioncode) as total_institutions,
-            COUNT(DISTINCT countrycode) as total_countries,
-            ROUND(AVG(CASE WHEN decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL THEN 100.0 ELSE 0.0 END), 1) as avg_georeferencing,
-            ROUND(AVG(CASE WHEN eventdate IS NOT NULL AND eventdate != '' THEN 100.0 ELSE 0.0 END), 1) as avg_date_quality
-        FROM dbo.harvestedfn2
-        WHERE family IS NOT NULL AND family != ''
-    """)
-
-    basic_result = db.execute(basic_stats_query).fetchone()
-
-    # 2. High diversity families (>50 genera per family)
-    high_diversity_families_query = text("""
-        SELECT COUNT(*) 
-        FROM (
-            SELECT family, COUNT(DISTINCT genus) as genera_count
-            FROM dbo.harvestedfn2 
-            WHERE family IS NOT NULL AND family != '' AND genus IS NOT NULL
-            GROUP BY family
-            HAVING COUNT(DISTINCT genus) > 50
-        ) high_diversity
-    """)
-
-    high_diversity_result = db.execute(high_diversity_families_query).scalar()
-
-    # 3. Well-sampled families (>1000 records per family)
-    well_sampled_families_query = text("""
-        SELECT COUNT(*) 
-        FROM (
-            SELECT family, COUNT(*) as record_count
-            FROM dbo.harvestedfn2 
-            WHERE family IS NOT NULL AND family != ''
-            GROUP BY family
-            HAVING COUNT(*) > 1000
-        ) well_sampled
-    """)
-
-    well_sampled_result = db.execute(well_sampled_families_query).scalar()
-
-    # 4. Global coverage families (records in >20 countries)
-    global_coverage_families_query = text("""
-        SELECT COUNT(*) 
-        FROM (
-            SELECT family, COUNT(DISTINCT country) as country_count
-            FROM dbo.harvestedfn2 
-            WHERE family IS NOT NULL AND family != '' AND country IS NOT NULL AND country != ''
-            GROUP BY family
-            HAVING COUNT(DISTINCT country) > 20
-        ) global_coverage
-    """)
-
-    global_coverage_result = db.execute(global_coverage_families_query).scalar()
-
-    # 5. Species-rich genera (>20 species per genus)
-    species_rich_genera_query = text("""
-        SELECT COUNT(*) 
-        FROM (
-            SELECT genus, COUNT(DISTINCT scientificname) as species_count
-            FROM dbo.harvestedfn2 
-            WHERE genus IS NOT NULL AND genus != '' AND scientificname IS NOT NULL
-            GROUP BY genus
-            HAVING COUNT(DISTINCT scientificname) > 20
-        ) species_rich
-    """)
-
-    species_rich_genera_result = db.execute(species_rich_genera_query).scalar()
-
-    # 6. Well-sampled genera (>500 records per genus)
-    well_sampled_genera_query = text("""
-        SELECT COUNT(*) 
-        FROM (
-            SELECT genus, COUNT(*) as record_count
-            FROM dbo.harvestedfn2 
-            WHERE genus IS NOT NULL AND genus != ''
-            GROUP BY genus
-            HAVING COUNT(*) > 500
-        ) well_sampled_genera
-    """)
-
-    well_sampled_genera_result = db.execute(well_sampled_genera_query).scalar()
-
-    # 7. Global coverage genera (records in >15 countries)
-    global_coverage_genera_query = text("""
-        SELECT COUNT(*) 
-        FROM (
-            SELECT genus, COUNT(DISTINCT country) as country_count
-            FROM dbo.harvestedfn2 
-            WHERE genus IS NOT NULL AND genus != '' AND country IS NOT NULL AND country != ''
-            GROUP BY genus
-            HAVING COUNT(DISTINCT country) > 15
-        ) global_coverage_genera
-    """)
-
-    global_coverage_genera_result = db.execute(global_coverage_genera_query).scalar()
-
-    # 8. Data quality metrics
-    quality_stats_query = text("""
-        SELECT 
-            -- Georeference quality distribution
-            COUNT(CASE WHEN decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL THEN 1 END) * 100.0 / COUNT(*) as georef_percentage,
-            -- Temporal data quality
-            COUNT(CASE WHEN eventdate IS NOT NULL AND eventdate != '' THEN 1 END) * 100.0 / COUNT(*) as date_percentage,
-            -- Taxonomic completeness
-            COUNT(CASE WHEN specificepithet IS NOT NULL AND genus IS NOT NULL AND family IS NOT NULL THEN 1 END) * 100.0 / COUNT(*) as taxonomy_completeness,
-            -- Institution coverage
-            COUNT(CASE WHEN institutioncode IS NOT NULL AND institutioncode != '' THEN 1 END) * 100.0 / COUNT(*) as institution_coverage
-        FROM dbo.harvestedfn2
-    """)
-
-    quality_result = db.execute(quality_stats_query).fetchone()
-
-    # 9. Recent activity (families with records in last 5 years)
-    recent_activity_query = text("""
-        SELECT COUNT(DISTINCT family)
-        FROM dbo.harvestedfn2 
-        WHERE family IS NOT NULL AND family != ''
-        AND (
-            "year" >= EXTRACT(YEAR FROM CURRENT_DATE) - 5
-            OR eventdate >= (CURRENT_DATE - INTERVAL '5 years')::text
-        )
-    """)
-
-    recent_families_result = db.execute(recent_activity_query).scalar()
-
-    # 10. Top contributors statistics
-    top_contributors_query = text("""
-        SELECT 
+    # Query 1: Family-level stats from cache table (fast - only hundreds of rows)
+    family_stats_query = text("""
+        SELECT
+            COUNT(*) as total_families,
+            COALESCE(SUM(record_count), 0) as total_records,
+            ROUND(SUM(georeferencing_quality * record_count) / NULLIF(SUM(record_count), 0), 1) as avg_georeferencing,
+            ROUND(SUM(date_quality * record_count) / NULLIF(SUM(record_count), 0), 1) as avg_date_quality,
+            COUNT(CASE WHEN genera_count > 50 THEN 1 END) as high_diversity_families,
+            COUNT(CASE WHEN record_count > 1000 THEN 1 END) as well_sampled_families,
+            COUNT(CASE WHEN countries_count > 20 THEN 1 END) as global_coverage_families,
             COUNT(CASE WHEN record_count > 10000 THEN 1 END) as major_families,
             COUNT(CASE WHEN record_count BETWEEN 1000 AND 10000 THEN 1 END) as active_families,
             COUNT(CASE WHEN record_count < 100 THEN 1 END) as underrepresented_families
-        FROM (
-            SELECT family, COUNT(*) as record_count
-            FROM dbo.harvestedfn2 
-            WHERE family IS NOT NULL AND family != ''
-            GROUP BY family
-        ) family_records
+        FROM dbo.family_stats
     """)
 
-    contributors_result = db.execute(top_contributors_query).fetchone()
+    # Query 2: Genus-level stats from cache table (fast)
+    genus_stats_query = text("""
+        SELECT
+            COUNT(*) as total_genera,
+            COUNT(CASE WHEN species_count > 20 THEN 1 END) as species_rich_genera,
+            COUNT(CASE WHEN record_count > 500 THEN 1 END) as well_sampled_genera,
+            COUNT(CASE WHEN countries_count > 15 THEN 1 END) as global_coverage_genera
+        FROM dbo.genus_stats
+    """)
 
-    # Assemble complete response
+    # Query 3: Species/institution counts from cache tables (fast)
+    counts_query = text("""
+        SELECT
+            (SELECT COUNT(*) FROM dbo.species_stats) as total_species,
+            (SELECT COUNT(*) FROM dbo.institution_stats) as total_institutions
+    """)
+
+    # Query 4: Metrics that require raw table - combined into ONE scan instead of 10
+    raw_metrics_query = text("""
+        SELECT
+            COUNT(DISTINCT CASE WHEN countrycode != '' AND LENGTH(countrycode) = 2 THEN countrycode END) as total_countries,
+            ROUND(
+                COUNT(CASE WHEN specificepithet IS NOT NULL AND genus IS NOT NULL AND family IS NOT NULL THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0), 1
+            ) as taxonomy_completeness,
+            ROUND(
+                COUNT(CASE WHEN institutioncode IS NOT NULL AND institutioncode != '' THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0), 1
+            ) as institution_coverage,
+            COUNT(DISTINCT CASE WHEN year >= EXTRACT(YEAR FROM CURRENT_DATE) - 5 THEN family END) as recently_active_families
+        FROM dbo.harvestedfn2_fin
+    """)
+
+    family_result = db.execute(family_stats_query).fetchone()
+    genus_result = db.execute(genus_stats_query).fetchone()
+    counts_result = db.execute(counts_query).fetchone()
+    raw_result = db.execute(raw_metrics_query).fetchone()
+
     return {
         # Basic statistics
-        "totalFamilies": basic_result[0] or 0,
-        "totalGenera": basic_result[1] or 0,
-        "totalSpecies": basic_result[2] or 0,
-        "totalRecords": basic_result[3] or 0,
-        "totalInstitutions": basic_result[4] or 0,
-        "totalCountries": basic_result[5] or 0,
+        "totalFamilies": family_result[0] or 0,
+        "totalGenera": genus_result[0] or 0,
+        "totalSpecies": counts_result[0] or 0,
+        "totalRecords": family_result[1] or 0,
+        "totalInstitutions": counts_result[1] or 0,
+        "totalCountries": raw_result[0] or 0,
 
         # Diversity metrics
-        "highDiversityFamilies": high_diversity_result or 0,
-        "wellSampledFamilies": well_sampled_result or 0,
-        "globalCoverageFamilies": global_coverage_result or 0,
+        "highDiversityFamilies": family_result[4] or 0,
+        "wellSampledFamilies": family_result[5] or 0,
+        "globalCoverageFamilies": family_result[6] or 0,
 
         # Genus-level statistics
-        "speciesRichGenera": species_rich_genera_result or 0,
-        "wellSampledGenera": well_sampled_genera_result or 0,
-        "globalCoverageGenera": global_coverage_genera_result or 0,
+        "speciesRichGenera": genus_result[1] or 0,
+        "wellSampledGenera": genus_result[2] or 0,
+        "globalCoverageGenera": genus_result[3] or 0,
 
-        # Quality metrics
-        "avgGeoreferencing": float(basic_result[6]) if basic_result[6] else 0.0,
-        "avgDateQuality": float(basic_result[7]) if basic_result[7] else 0.0,
-        "taxonomyCompleteness": float(quality_result[2]) if quality_result[2] else 0.0,
-        "institutionCoverage": float(quality_result[3]) if quality_result[3] else 0.0,
+        # Quality metrics (weighted average from cache, raw metrics from single scan)
+        "avgGeoreferencing": float(family_result[2]) if family_result[2] else 0.0,
+        "avgDateQuality": float(family_result[3]) if family_result[3] else 0.0,
+        "taxonomyCompleteness": float(raw_result[1]) if raw_result[1] else 0.0,
+        "institutionCoverage": float(raw_result[2]) if raw_result[2] else 0.0,
 
         # Activity metrics
-        "recentlyActiveFamilies": recent_families_result or 0,
+        "recentlyActiveFamilies": raw_result[3] or 0,
 
         # Contribution distribution
-        "majorContributorFamilies": contributors_result[0] or 0,
-        "activeContributorFamilies": contributors_result[1] or 0,
-        "underrepresentedFamilies": contributors_result[2] or 0,
+        "majorContributorFamilies": family_result[7] or 0,
+        "activeContributorFamilies": family_result[8] or 0,
+        "underrepresentedFamilies": family_result[9] or 0,
 
         # Calculation timestamp
         "calculatedAt": datetime.now().isoformat()
@@ -2386,7 +2278,7 @@ async def get_institution_records(
                scientificnameauthorship, recordedby, eventdate, country, 
                locality, decimallatitude, decimallongitude, institutioncode,
                collectioncode, basisofrecord, "year", "month"
-        FROM dbo.harvestedfn2
+        FROM dbo.harvestedfn2_fin
         WHERE institutioncode = :institution_code
     """
 
@@ -2436,7 +2328,7 @@ async def get_institution_records(
 
     # Build query
     data_query = text(base_select + where_clause + f" ORDER BY {order_by} LIMIT :limit OFFSET :offset")
-    count_query = text(f"SELECT COUNT(*) FROM dbo.harvestedfn2 WHERE institutioncode = :institution_code{where_clause}")
+    count_query = text(f"SELECT COUNT(*) FROM dbo.harvestedfn2_fin WHERE institutioncode = :institution_code{where_clause}")
 
     # Execute query
     params.update({
@@ -2490,17 +2382,17 @@ async def get_institution_records_summary(
     summary_query = text("""
         SELECT 
             COUNT(*) as total_records,
-            COUNT(DISTINCT scientificname) as unique_species,
+            COUNT(DISTINCT COALESCE(validname, scientificname)) as unique_species,
             COUNT(DISTINCT family) as unique_families,
             COUNT(DISTINCT genus) as unique_genera,
-            COUNT(DISTINCT country) as unique_countries,
+            COUNT(DISTINCT countrycode) as unique_countries,
             COUNT(DISTINCT collectioncode) as unique_collections,
             COUNT(CASE WHEN decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL THEN 1 END) as georeferenced_records,
             COUNT(CASE WHEN eventdate IS NOT NULL AND eventdate != '' THEN 1 END) as dated_records,
             MIN(CASE WHEN "year" IS NOT NULL AND "year" > 1800 THEN "year" END) as earliest_year,
             MAX(CASE WHEN "year" IS NOT NULL AND "year" > 1800 THEN "year" END) as latest_year,
             COUNT(CASE WHEN "year" >= 2020 THEN 1 END) as recent_records
-        FROM dbo.harvestedfn2 
+        FROM dbo.harvestedfn2_fin 
         WHERE institutioncode = :institution_code
     """)
 
@@ -2544,7 +2436,7 @@ async def get_institution_records_filters(
     # Get available years
     years_query = text("""
         SELECT DISTINCT "year"
-        FROM dbo.harvestedfn2 
+        FROM dbo.harvestedfn2_fin 
         WHERE institutioncode = :institution_code 
           AND "year" IS NOT NULL AND "year" > 1800
         ORDER BY "year" DESC
@@ -2553,7 +2445,7 @@ async def get_institution_records_filters(
     # Get available countries
     countries_query = text("""
         SELECT DISTINCT country, COUNT(*) as record_count
-        FROM dbo.harvestedfn2 
+        FROM dbo.harvestedfn2_fin 
         WHERE institutioncode = :institution_code 
           AND country IS NOT NULL AND country != ''
         GROUP BY country
@@ -2563,7 +2455,7 @@ async def get_institution_records_filters(
     # Get available families
     families_query = text("""
         SELECT DISTINCT family, COUNT(*) as record_count
-        FROM dbo.harvestedfn2 
+        FROM dbo.harvestedfn2_fin 
         WHERE institutioncode = :institution_code 
           AND family IS NOT NULL AND family != ''
         GROUP BY family
@@ -2573,7 +2465,7 @@ async def get_institution_records_filters(
     # Get available genera
     genera_query = text("""
         SELECT DISTINCT genus, COUNT(*) as record_count
-        FROM dbo.harvestedfn2 
+        FROM dbo.harvestedfn2_fin 
         WHERE institutioncode = :institution_code 
           AND genus IS NOT NULL AND genus != ''
         GROUP BY genus
@@ -2584,7 +2476,7 @@ async def get_institution_records_filters(
     # Get available collection codes
     collections_query = text("""
         SELECT DISTINCT collectioncode, COUNT(*) as record_count
-        FROM dbo.harvestedfn2 
+        FROM dbo.harvestedfn2_fin 
         WHERE institutioncode = :institution_code 
           AND collectioncode IS NOT NULL AND collectioncode != ''
         GROUP BY collectioncode
@@ -2628,7 +2520,7 @@ async def export_institution_records(
                locality, decimallatitude, decimallongitude, institutioncode,
                collectioncode, basisofrecord, "year", "month", day,
                county, stateprovince, kingdom, phylum, "class", "order"
-        FROM dbo.harvestedfn2
+        FROM dbo.harvestedfn2_fin
         WHERE institutioncode = :institution_code
     """
 
@@ -2801,14 +2693,14 @@ async def get_records_by_institution(
         SELECT catalognumber, scientificname, vernacularname, family, genus,
                recordedby, eventdate, country, locality, decimallatitude, 
                decimallongitude, institutioncode, collectioncode
-        FROM dbo.harvestedfn2
+        FROM dbo.harvestedfn2_fin
         WHERE institutioncode = :institution_code
         ORDER BY eventdate DESC NULLS LAST
         LIMIT :limit OFFSET :offset
     """)
 
     count_query = text("""
-        SELECT COUNT(*) FROM dbo.harvestedfn2 WHERE institutioncode = :institution_code
+        SELECT COUNT(*) FROM dbo.harvestedfn2_fin WHERE institutioncode = :institution_code
     """)
 
     total = db.execute(count_query, {"institution_code": institution_code}).scalar()
@@ -2871,7 +2763,7 @@ async def get_records_by_institution_v2(
                scientificnameauthorship, recordedby, eventdate, country, 
                locality, decimallatitude, decimallongitude, institutioncode,
                collectioncode, basisofrecord, "year", "month"
-        FROM dbo.harvestedfn2
+        FROM dbo.harvestedfn2_fin
         WHERE institutioncode = :institution_code
     """
 
@@ -2926,7 +2818,7 @@ async def get_records_by_institution_v2(
 
     # Build query
     data_query = text(base_select + where_clause + f" ORDER BY {order_by} LIMIT :limit OFFSET :offset")
-    count_query = text(f"SELECT COUNT(*) FROM dbo.harvestedfn2 WHERE institutioncode = :institution_code{where_clause}")
+    count_query = text(f"SELECT COUNT(*) FROM dbo.harvestedfn2_fin WHERE institutioncode = :institution_code{where_clause}")
 
     # Execute query
     params.update({
@@ -2975,11 +2867,11 @@ async def get_institutions_stats(db: Session = Depends(get_db)):
 
     # 1. Basic statistics - each institution counted only once
     basic_stats_query = text("""
-        SELECT 
+        SELECT
             COUNT(*) as total_institutions,
             SUM(array_length(collection_codes, 1)) as total_collection_codes,
             SUM(record_count) as total_records,
-            COUNT(DISTINCT country) as total_countries,
+            (SELECT COUNT(DISTINCT country) FROM dbo.institution_country_distribution) as total_countries,
             ROUND(AVG(georeferencing_quality), 1) as avg_georeferencing,
             ROUND(AVG(date_quality), 1) as avg_date_quality
         FROM dbo.institution_stats
@@ -3107,9 +2999,9 @@ async def get_institution_countries(institution_code: str, db: Session = Depends
 async def get_orders(db: Session = Depends(get_db)):
     """Get all orders"""
     query = text("""
-        SELECT "order", COUNT(DISTINCT family) as family_count, 
-               COUNT(DISTINCT scientificname) as species_count
-        FROM dbo.harvestedfn2 
+        SELECT "order", COUNT(*) as family_count,
+               COALESCE(SUM(species_count), 0) as species_count
+        FROM dbo.family_stats
         WHERE "order" IS NOT NULL AND "order" != ''
         GROUP BY "order"
         ORDER BY species_count DESC
@@ -3137,47 +3029,42 @@ async def get_records_by_taxon(
         db: Session = Depends(get_db)
 ):
     """Get records by taxonomic unit"""
-    field_mapping = {
-        "family": "family",
-        "genus": "genus",
-        "species": "specificepithet"
-    }
-
-    if taxon_type not in field_mapping:
+    if taxon_type not in ["family", "genus", "species"]:
         raise HTTPException(status_code=400, detail="Invalid taxon type")
 
-    field = field_mapping[taxon_type]
+    taxon_condition, taxon_params = parse_taxon_filter(taxon_type, taxon_name)
 
     # Build WHERE clause
-    where_conditions = [f"{field} = :taxon_name"]
-    
+    where_conditions = [taxon_condition]
+
     if has_coordinates is True:
         where_conditions.append("decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL")
     elif has_coordinates is False:
         where_conditions.append("(decimallatitude IS NULL OR decimallongitude IS NULL)")
-    
+
     where_clause = " AND ".join(where_conditions)
 
     query = text(f"""
         SELECT catalognumber, scientificname, vernacularname, family, genus,
-               recordedby, eventdate, country, locality, decimallatitude, 
+               recordedby, eventdate, country, locality, decimallatitude,
                decimallongitude, institutioncode, collectioncode
-        FROM dbo.harvestedfn2
+        FROM dbo.harvestedfn2_fin
         WHERE {where_clause}
         ORDER BY eventdate DESC NULLS LAST
         LIMIT :limit OFFSET :offset
     """)
 
     count_query = text(f"""
-        SELECT COUNT(*) FROM dbo.harvestedfn2 WHERE {where_clause}
+        SELECT COUNT(*) FROM dbo.harvestedfn2_fin WHERE {where_clause}
     """)
 
-    total = db.execute(count_query, {"taxon_name": taxon_name}).scalar()
-    result = db.execute(query, {
-        "taxon_name": taxon_name,
+    total = db.execute(count_query, taxon_params).scalar()
+    query_params = dict(taxon_params)
+    query_params.update({
         "limit": per_page,
         "offset": (page - 1) * per_page
-    }).fetchall()
+    })
+    result = db.execute(query, query_params).fetchall()
 
     records = []
     for row in result:
@@ -3207,6 +3094,61 @@ async def get_records_by_taxon(
     )
 
 
+@app.get("/records/taxon/{taxon_type}/{taxon_name}/map-points")
+async def get_taxon_map_points(
+        taxon_type: str,
+        taxon_name: str,
+        south: Optional[float] = Query(None, description="South bound latitude"),
+        north: Optional[float] = Query(None, description="North bound latitude"),
+        west: Optional[float] = Query(None, description="West bound longitude"),
+        east: Optional[float] = Query(None, description="East bound longitude"),
+        db: Session = Depends(get_db)
+):
+    """Return coordinate points for heatmap rendering.
+    Coordinates are snapped to ~1km grid (ROUND 2 decimals) and grouped with weight.
+    Returns [[lat, lng, weight], ...] — no data is lost, weight = record count at that spot.
+    Frontend: L.heatLayer(data.points)  (Leaflet.heat accepts [lat, lng, intensity])
+    """
+    if taxon_type not in ["family", "genus", "species"]:
+        raise HTTPException(status_code=400, detail="Invalid taxon type")
+
+    taxon_condition, taxon_params = parse_taxon_filter(taxon_type, taxon_name)
+    query_params = dict(taxon_params)
+
+    # Viewport bounds filter
+    bounds_condition = ""
+    if south is not None and north is not None and west is not None and east is not None:
+        bounds_condition = " AND decimallatitude BETWEEN :south AND :north AND decimallongitude BETWEEN :west AND :east"
+        query_params.update({"south": south, "north": north, "west": west, "east": east})
+
+    query = text(f"""
+        SELECT ROUND(decimallatitude::numeric, 2) as lat,
+               ROUND(decimallongitude::numeric, 2) as lng,
+               COUNT(*) as weight
+        FROM dbo.harvestedfn2_fin
+        WHERE {taxon_condition}
+          AND decimallatitude IS NOT NULL
+          AND decimallongitude IS NOT NULL
+          {bounds_condition}
+        GROUP BY ROUND(decimallatitude::numeric, 2), ROUND(decimallongitude::numeric, 2)
+    """)
+
+    result = db.execute(query, query_params).fetchall()
+
+    total_records = 0
+    points = []
+    for row in result:
+        w = int(row[2])
+        total_records += w
+        points.append([float(row[0]), float(row[1]), w])
+
+    return {
+        "points": points,
+        "total": len(points),
+        "totalRecords": total_records
+    }
+
+
 # Taxonomy hierarchy endpoints
 
 @app.get("/families/{family_name}/children")
@@ -3218,19 +3160,14 @@ async def get_family_children(
         sort_by: str = "records_desc",
         db: Session = Depends(get_db)
 ):
-    """Get all genera under a family"""
+    """Get all genera under a family - uses genus_stats cache table"""
 
-    # Build base query
-    base_query = """
-        SELECT genus, COUNT(DISTINCT specificepithet) as species_count,
-               COUNT(*) as record_count, COUNT(DISTINCT country) as countries_count,
-               COUNT(DISTINCT institutioncode) as institutions_count,
-               ROUND(
-                   COUNT(CASE WHEN decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL THEN 1 END) * 100.0 / COUNT(*), 2
-               ) as georeferencing_quality,
-               MAX(eventdate) as last_record
-        FROM dbo.harvestedfn2 
-        WHERE family = :family_name AND genus IS NOT NULL AND genus != ''
+    # Build query from genus_stats cache table
+    base_select = """
+        SELECT genus, species_count, record_count, countries_count,
+               institutions_count, georeferencing_quality, last_updated
+        FROM dbo.genus_stats
+        WHERE family = :family_name
     """
 
     conditions = []
@@ -3239,8 +3176,6 @@ async def get_family_children(
     if search:
         conditions.append("genus ILIKE :search")
         params["search"] = f"%{search}%"
-
-    group_clause = " GROUP BY genus"
 
     # Sort
     sort_mapping = {
@@ -3251,16 +3186,14 @@ async def get_family_children(
     }
     order_clause = f" ORDER BY {sort_mapping.get(sort_by, 'record_count DESC')}"
 
-    # Build complete query
     where_clause = ""
     if conditions:
         where_clause = " AND " + " AND ".join(conditions)
 
-    query = text(base_query + where_clause + group_clause + order_clause + " LIMIT :limit OFFSET :offset")
+    query = text(base_select + where_clause + order_clause + " LIMIT :limit OFFSET :offset")
     count_query = text(
-        f"SELECT COUNT(DISTINCT genus) FROM dbo.harvestedfn2 WHERE family = :family_name AND genus IS NOT NULL AND genus != ''{where_clause}")
+        f"SELECT COUNT(*) FROM dbo.genus_stats WHERE family = :family_name{where_clause}")
 
-    # Execute query
     params.update({
         "limit": per_page,
         "offset": (page - 1) * per_page
@@ -3299,34 +3232,28 @@ async def get_genus_children(
         sort_by: str = "records_desc",
         db: Session = Depends(get_db)
 ):
-    """Get all species under a genus"""
+    """Get all species under a genus - uses species_stats cache table"""
 
-    base_query = """
-        SELECT scientificname, vernacularname, COUNT(*) as record_count,
-               COUNT(DISTINCT country) as countries_count,
-               COUNT(DISTINCT institutioncode) as institutions_count,
-               ROUND(
-                   COUNT(CASE WHEN decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL THEN 1 END) * 100.0 / COUNT(*), 2
-               ) as georeferencing_quality,
-               MAX(eventdate) as last_record
-        FROM dbo.harvestedfn2 
-        WHERE genus = :genus_name AND scientificname IS NOT NULL AND scientificname != ''
+    base_select = """
+        SELECT genus || ' ' || specificepithet as scientificname, vernacularname,
+               record_count, countries_count, institutions_count,
+               georeferencing_quality, last_record
+        FROM dbo.species_stats
+        WHERE genus = :genus_name
     """
 
     conditions = []
     params = {"genus_name": genus_name}
 
     if search:
-        conditions.append("(scientificname ILIKE :search OR vernacularname ILIKE :search)")
+        conditions.append("(genus || ' ' || specificepithet ILIKE :search OR vernacularname ILIKE :search)")
         params["search"] = f"%{search}%"
-
-    group_clause = " GROUP BY scientificname, vernacularname"
 
     # Sort
     sort_mapping = {
         "records_desc": "record_count DESC",
-        "name_asc": "scientificname ASC",
-        "name_desc": "scientificname DESC"
+        "name_asc": "specificepithet ASC",
+        "name_desc": "specificepithet DESC"
     }
     order_clause = f" ORDER BY {sort_mapping.get(sort_by, 'record_count DESC')}"
 
@@ -3334,9 +3261,9 @@ async def get_genus_children(
     if conditions:
         where_clause = " AND " + " AND ".join(conditions)
 
-    query = text(base_query + where_clause + group_clause + order_clause + " LIMIT :limit OFFSET :offset")
+    query = text(base_select + where_clause + order_clause + " LIMIT :limit OFFSET :offset")
     count_query = text(
-        f"SELECT COUNT(DISTINCT scientificname) FROM dbo.harvestedfn2 WHERE genus = :genus_name AND scientificname IS NOT NULL AND scientificname != ''{where_clause}")
+        f"SELECT COUNT(*) FROM dbo.species_stats WHERE genus = :genus_name{where_clause}")
 
     params.update({
         "limit": per_page,
@@ -3379,24 +3306,21 @@ async def get_taxon_diversity(
         raise HTTPException(status_code=400, detail="Invalid taxon type")
 
     if taxon_type == "family":
-        # Family diversity - statistics by genus
+        # Family diversity - from genus_stats cache table
         query = text("""
-            SELECT genus, COUNT(DISTINCT specificepithet) as species_count,
-                   COUNT(*) as record_count
-            FROM dbo.harvestedfn2 
-            WHERE family = :taxon_name AND genus IS NOT NULL AND genus != ''
-            GROUP BY genus
+            SELECT genus, species_count, record_count
+            FROM dbo.genus_stats
+            WHERE family = :taxon_name
             ORDER BY record_count DESC
             LIMIT 10
         """)
     elif taxon_type == "genus":
-        # Genus diversity - statistics by species
+        # Genus diversity - from species_stats cache table
         query = text("""
-            SELECT scientificname, COUNT(*) as record_count,
-                   MAX(vernacularname) as vernacular_name
-            FROM dbo.harvestedfn2 
-            WHERE genus = :taxon_name AND scientificname IS NOT NULL AND scientificname != ''
-            GROUP BY scientificname
+            SELECT genus || ' ' || specificepithet as scientificname,
+                   record_count, vernacularname
+            FROM dbo.species_stats
+            WHERE genus = :taxon_name
             ORDER BY record_count DESC
             LIMIT 10
         """)
@@ -3424,6 +3348,23 @@ async def get_taxon_diversity(
     return {"diversityData": diversity_data}
 
 
+def parse_taxon_filter(taxon_type: str, taxon_name: str):
+    """Parse taxon type and name into SQL WHERE condition and params.
+    For species, splits 'Genus epithet' into genus + specificepithet conditions.
+    """
+    if taxon_type == "species":
+        parts = taxon_name.strip().split(' ', 1)
+        if len(parts) >= 2:
+            return ("genus = :genus_name AND specificepithet = :specific_epithet",
+                    {"genus_name": parts[0], "specific_epithet": parts[1]})
+        else:
+            return "specificepithet = :taxon_name", {"taxon_name": taxon_name}
+    else:
+        field_mapping = {"family": "family", "genus": "genus"}
+        field = field_mapping[taxon_type]
+        return f"{field} = :taxon_name", {"taxon_name": taxon_name}
+
+
 @app.get("/{taxon_type}/{taxon_name}/geographic")
 async def get_taxon_geographic_distribution(
         taxon_type: str,
@@ -3435,13 +3376,12 @@ async def get_taxon_geographic_distribution(
     if taxon_type not in ["family", "genus", "species"]:
         raise HTTPException(status_code=400, detail="Invalid taxon type")
 
-    field_mapping = {"family": "family", "genus": "genus", "species": "specificepithet"}
-    field = field_mapping[taxon_type]
+    taxon_condition, taxon_params = parse_taxon_filter(taxon_type, taxon_name)
 
     # 1. Continental distribution statistics
     continent_query = text(f"""
-        SELECT 
-            CASE 
+        SELECT
+            CASE
                 WHEN country IN ('United States', 'USA', 'US', 'Canada', 'Mexico') THEN 'North America'
                 WHEN country IN ('United Kingdom', 'UK', 'France', 'Germany', 'Spain', 'Italy', 'Netherlands', 'Sweden', 'Norway') THEN 'Europe'
                 WHEN country IN ('China', 'Japan', 'Australia', 'New Zealand', 'India', 'South Korea', 'Thailand', 'Malaysia', 'Singapore') THEN 'Asia-Pacific'
@@ -3451,10 +3391,10 @@ async def get_taxon_geographic_distribution(
             END as continent,
             COUNT(*) as records,
             ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) as percentage
-        FROM dbo.harvestedfn2 
-        WHERE {field} = :taxon_name AND country IS NOT NULL AND country != ''
-        GROUP BY 
-            CASE 
+        FROM dbo.harvestedfn2_fin
+        WHERE {taxon_condition} AND country IS NOT NULL AND country != ''
+        GROUP BY
+            CASE
                 WHEN country IN ('United States', 'USA', 'US', 'Canada', 'Mexico') THEN 'North America'
                 WHEN country IN ('United Kingdom', 'UK', 'France', 'Germany', 'Spain', 'Italy', 'Netherlands', 'Sweden', 'Norway') THEN 'Europe'
                 WHEN country IN ('China', 'Japan', 'Australia', 'New Zealand', 'India', 'South Korea', 'Thailand', 'Malaysia', 'Singapore') THEN 'Asia-Pacific'
@@ -3465,41 +3405,41 @@ async def get_taxon_geographic_distribution(
         ORDER BY records DESC
     """)
 
-    continent_result = db.execute(continent_query, {"taxon_name": taxon_name}).fetchall()
+    continent_result = db.execute(continent_query, taxon_params).fetchall()
 
     # 2. Country distribution statistics
     country_query = text(f"""
         SELECT country, COUNT(*) as records,
-               COUNT(DISTINCT CASE WHEN {field} = :taxon_name THEN scientificname END) as species_count,
+               COUNT(DISTINCT COALESCE(validname, scientificname)) as species_count,
                ROUND(
                    COUNT(CASE WHEN decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL THEN 1 END) * 100.0 / COUNT(*), 1
                ) as data_quality
-        FROM dbo.harvestedfn2 
-        WHERE {field} = :taxon_name AND country IS NOT NULL AND country != ''
+        FROM dbo.harvestedfn2_fin
+        WHERE {taxon_condition} AND country IS NOT NULL AND country != ''
         GROUP BY country
         ORDER BY records DESC
         LIMIT 20
     """)
 
-    country_result = db.execute(country_query, {"taxon_name": taxon_name}).fetchall()
+    country_result = db.execute(country_query, taxon_params).fetchall()
 
     # 3. Biodiversity hotspots
     hotspot_query = text(f"""
         SELECT country, COUNT(*) as records,
-               COUNT(DISTINCT scientificname) as species_count,
+               COUNT(DISTINCT COALESCE(validname, scientificname)) as species_count,
                COUNT(DISTINCT genus) as genera_count,
                ROUND(
                    COUNT(CASE WHEN decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL THEN 1 END) * 100.0 / COUNT(*), 1
                ) as data_quality
-        FROM dbo.harvestedfn2 
-        WHERE {field} = :taxon_name AND country IS NOT NULL AND country != ''
+        FROM dbo.harvestedfn2_fin
+        WHERE {taxon_condition} AND country IS NOT NULL AND country != ''
         GROUP BY country
         HAVING COUNT(*) > 100  -- Only show regions with sufficient records
         ORDER BY species_count DESC, records DESC
         LIMIT 8
     """)
 
-    hotspot_result = db.execute(hotspot_query, {"taxon_name": taxon_name}).fetchall()
+    hotspot_result = db.execute(hotspot_query, taxon_params).fetchall()
 
     continental_distribution = []
     for row in continent_result:
@@ -3549,14 +3489,13 @@ async def get_taxon_temporal_patterns(
     if taxon_type not in ["family", "genus", "species"]:
         raise HTTPException(status_code=400, detail="Invalid taxon type")
 
-    field_mapping = {"family": "family", "genus": "genus", "species": "specificepithet"}
-    field = field_mapping[taxon_type]
+    taxon_condition, taxon_params = parse_taxon_filter(taxon_type, taxon_name)
 
     # 1. Historical period statistics
     historical_query = text(f"""
         WITH period_data AS (
-            SELECT 
-                CASE 
+            SELECT
+                CASE
                     WHEN year < 1950 THEN 'Pre-1950'
                     WHEN year BETWEEN 1950 AND 1990 THEN '1950-1990'
                     WHEN year BETWEEN 1991 AND 2010 THEN '1991-2010'
@@ -3564,10 +3503,11 @@ async def get_taxon_temporal_patterns(
                     ELSE 'Unknown'
                 END as period,
                 COUNT(*) as records
-            FROM dbo.harvestedfn2 
-            WHERE {field} = :taxon_name AND year IS NOT NULL AND year > 1800
-            GROUP BY 
-                CASE 
+            FROM dbo.harvestedfn2_fin
+            WHERE {taxon_condition} AND year IS NOT NULL AND year > 1800
+              AND year <= EXTRACT(YEAR FROM CURRENT_DATE)
+            GROUP BY
+                CASE
                     WHEN year < 1950 THEN 'Pre-1950'
                     WHEN year BETWEEN 1950 AND 1990 THEN '1950-1990'
                     WHEN year BETWEEN 1991 AND 2010 THEN '1991-2010'
@@ -3575,12 +3515,12 @@ async def get_taxon_temporal_patterns(
                     ELSE 'Unknown'
                 END
         )
-        SELECT 
+        SELECT
             period,
             records,
             ROUND(records * 100.0 / SUM(records) OVER (), 1) as percentage
         FROM period_data
-        ORDER BY 
+        ORDER BY
             CASE period
                 WHEN 'Pre-1950' THEN 1
                 WHEN '1950-1990' THEN 2
@@ -3593,8 +3533,8 @@ async def get_taxon_temporal_patterns(
     # 2. Seasonal patterns
     seasonal_query = text(f"""
         WITH seasonal_data AS (
-            SELECT 
-                CASE 
+            SELECT
+                CASE
                     WHEN month IN (3, 4, 5) THEN 'Spring (Mar-May)'
                     WHEN month IN (6, 7, 8) THEN 'Summer (Jun-Aug)'
                     WHEN month IN (9, 10, 11) THEN 'Autumn (Sep-Nov)'
@@ -3602,10 +3542,10 @@ async def get_taxon_temporal_patterns(
                     ELSE 'Unknown'
                 END as season,
                 COUNT(*) as records
-            FROM dbo.harvestedfn2 
-            WHERE {field} = :taxon_name AND month IS NOT NULL
-            GROUP BY 
-                CASE 
+            FROM dbo.harvestedfn2_fin
+            WHERE {taxon_condition} AND month IS NOT NULL
+            GROUP BY
+                CASE
                     WHEN month IN (3, 4, 5) THEN 'Spring (Mar-May)'
                     WHEN month IN (6, 7, 8) THEN 'Summer (Jun-Aug)'
                     WHEN month IN (9, 10, 11) THEN 'Autumn (Sep-Nov)'
@@ -3621,8 +3561,9 @@ async def get_taxon_temporal_patterns(
     # 3. Recent activity
     recent_query = text(f"""
         SELECT year, COUNT(*) as records
-        FROM dbo.harvestedfn2 
-        WHERE {field} = :taxon_name AND year >= 2020 AND year IS NOT NULL
+        FROM dbo.harvestedfn2_fin
+        WHERE {taxon_condition} AND year >= 2020 AND year IS NOT NULL
+          AND year <= EXTRACT(YEAR FROM CURRENT_DATE)
         GROUP BY year
         ORDER BY year DESC
     """)
@@ -3630,9 +3571,9 @@ async def get_taxon_temporal_patterns(
     # 4. Annual trend data (for timeline charts)
     yearly_trend_query = text(f"""
         SELECT year, COUNT(*) as records
-        FROM dbo.harvestedfn2 
-        WHERE {field} = :taxon_name 
-          AND year IS NOT NULL 
+        FROM dbo.harvestedfn2_fin
+        WHERE {taxon_condition}
+          AND year IS NOT NULL
           AND year BETWEEN 1950 AND EXTRACT(YEAR FROM CURRENT_DATE)
         GROUP BY year
         ORDER BY year
@@ -3641,31 +3582,31 @@ async def get_taxon_temporal_patterns(
     # 5. Monthly distribution
     monthly_distribution_query = text(f"""
         SELECT month, COUNT(*) as records
-        FROM dbo.harvestedfn2 
-        WHERE {field} = :taxon_name AND month IS NOT NULL AND month BETWEEN 1 AND 12
+        FROM dbo.harvestedfn2_fin
+        WHERE {taxon_condition} AND month IS NOT NULL AND month BETWEEN 1 AND 12
         GROUP BY month
         ORDER BY month
     """)
 
     # 6. Data coverage
     data_coverage_query = text(f"""
-        SELECT 
+        SELECT
             COUNT(*) as total_records,
             COUNT(CASE WHEN year IS NOT NULL AND year > 1800 THEN 1 END) as records_with_year,
             COUNT(CASE WHEN month IS NOT NULL THEN 1 END) as records_with_month,
             COUNT(CASE WHEN eventdate IS NOT NULL AND eventdate != '' THEN 1 END) as records_with_date
-        FROM dbo.harvestedfn2 
-        WHERE {field} = :taxon_name
+        FROM dbo.harvestedfn2_fin
+        WHERE {taxon_condition}
     """)
 
     try:
         # Execute query
-        historical_result = db.execute(historical_query, {"taxon_name": taxon_name}).fetchall()
-        seasonal_result = db.execute(seasonal_query, {"taxon_name": taxon_name}).fetchall()
-        recent_result = db.execute(recent_query, {"taxon_name": taxon_name}).fetchall()
-        yearly_trend_result = db.execute(yearly_trend_query, {"taxon_name": taxon_name}).fetchall()
-        monthly_result = db.execute(monthly_distribution_query, {"taxon_name": taxon_name}).fetchall()
-        coverage_result = db.execute(data_coverage_query, {"taxon_name": taxon_name}).fetchone()
+        historical_result = db.execute(historical_query, taxon_params).fetchall()
+        seasonal_result = db.execute(seasonal_query, taxon_params).fetchall()
+        recent_result = db.execute(recent_query, taxon_params).fetchall()
+        yearly_trend_result = db.execute(yearly_trend_query, taxon_params).fetchall()
+        monthly_result = db.execute(monthly_distribution_query, taxon_params).fetchall()
+        coverage_result = db.execute(data_coverage_query, taxon_params).fetchone()
 
         # Process results
         historical_periods = []
@@ -3771,30 +3712,29 @@ async def get_taxon_institutions(
     if taxon_type not in ["family", "genus", "species"]:
         raise HTTPException(status_code=400, detail="Invalid taxon type")
 
-    field_mapping = {"family": "family", "genus": "genus", "species": "specificepithet"}
-    field = field_mapping[taxon_type]
+    taxon_condition, taxon_params = parse_taxon_filter(taxon_type, taxon_name)
 
     base_query = f"""
         SELECT institutioncode,
                COUNT(*) as record_count,
-               COUNT(DISTINCT scientificname) as species_count,
+               COUNT(DISTINCT COALESCE(validname, scientificname)) as species_count,
                COUNT(DISTINCT genus) as genera_count,
-               COUNT(DISTINCT country) as countries_count,
+               COUNT(DISTINCT countrycode) as countries_count,
                ROUND(
                    COUNT(CASE WHEN decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL THEN 1 END) * 100.0 / COUNT(*), 1
                ) as georeferencing_quality,
-               array_agg(DISTINCT collectioncode ORDER BY collectioncode) 
+               array_agg(DISTINCT collectioncode ORDER BY collectioncode)
                FILTER (WHERE collectioncode IS NOT NULL AND collectioncode != '') as collection_codes,
                MAX(eventdate) as latest_record,
                ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) as percentage,
                -- Add country info for map display
                (array_agg(DISTINCT country ORDER BY country))[1] as primary_country
-        FROM dbo.harvestedfn2 
-        WHERE {field} = :taxon_name AND institutioncode IS NOT NULL AND institutioncode != ''
+        FROM dbo.harvestedfn2_fin
+        WHERE {taxon_condition} AND institutioncode IS NOT NULL AND institutioncode != ''
     """
 
     conditions = []
-    params = {"taxon_name": taxon_name}
+    params = dict(taxon_params)
 
     if search:
         conditions.append("institutioncode ILIKE :search")
@@ -3817,7 +3757,7 @@ async def get_taxon_institutions(
 
     query = text(base_query + where_clause + group_clause + order_clause + " LIMIT :limit OFFSET :offset")
     count_query = text(
-        f"SELECT COUNT(DISTINCT institutioncode) FROM dbo.harvestedfn2 WHERE {field} = :taxon_name AND institutioncode IS NOT NULL AND institutioncode != ''{where_clause}")
+        f"SELECT COUNT(DISTINCT institutioncode) FROM dbo.harvestedfn2_fin WHERE {taxon_condition} AND institutioncode IS NOT NULL AND institutioncode != ''{where_clause}")
 
     params.update({
         "limit": per_page,
@@ -3874,104 +3814,48 @@ async def get_taxon_map_data(
     if taxon_type not in ["family", "genus", "species"]:
         raise HTTPException(status_code=400, detail="Invalid taxon type")
 
-    field_mapping = {"family": "family", "genus": "genus", "species": "specificepithet"}
-    field = field_mapping[taxon_type]
+    taxon_condition, taxon_params = parse_taxon_filter(taxon_type, taxon_name)
 
-    # Get institution data grouped by country
+    # Get institution data grouped by country, using actual coordinate averages
     query = text(f"""
-        SELECT 
+        SELECT
             country,
             COUNT(DISTINCT institutioncode) as institution_count,
             COUNT(*) as total_records,
-            AVG(CASE WHEN decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL THEN 1.0 ELSE 0.0 END) * 100 as avg_georeferencing
-        FROM dbo.harvestedfn2 
-        WHERE {field} = :taxon_name 
+            ROUND(AVG(CASE WHEN decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL
+                           THEN 1.0 ELSE 0.0 END) * 100, 1) as avg_georeferencing,
+            AVG(decimallatitude) FILTER (WHERE decimallatitude IS NOT NULL) as avg_lat,
+            AVG(decimallongitude) FILTER (WHERE decimallongitude IS NOT NULL) as avg_lng,
+            COUNT(DISTINCT COALESCE(validname, scientificname)) as species_count
+        FROM dbo.harvestedfn2_fin
+        WHERE {taxon_condition}
           AND country IS NOT NULL AND country != ''
           AND institutioncode IS NOT NULL AND institutioncode != ''
         GROUP BY country
-        HAVING COUNT(*) > 10  -- Only show countries with sufficient records
+        HAVING COUNT(*) > 10
         ORDER BY total_records DESC
         LIMIT 50
     """)
 
-    result = db.execute(query, {"taxon_name": taxon_name}).fetchall()
-
-    # Country coordinate mapping (in production, use geocoding service)
-    country_coords = {
-        'United States': {'lat': 39.8283, 'lng': -98.5795},
-        'USA': {'lat': 39.8283, 'lng': -98.5795},
-        'US': {'lat': 39.8283, 'lng': -98.5795},
-        'United Kingdom': {'lat': 55.3781, 'lng': -3.4360},
-        'UK': {'lat': 55.3781, 'lng': -3.4360},
-        'Canada': {'lat': 56.1304, 'lng': -106.3468},
-        'Australia': {'lat': -25.2744, 'lng': 133.7751},
-        'Germany': {'lat': 51.1657, 'lng': 10.4515},
-        'France': {'lat': 46.2276, 'lng': 2.2137},
-        'Japan': {'lat': 36.2048, 'lng': 138.2529},
-        'Brazil': {'lat': -14.2350, 'lng': -51.9253},
-        'China': {'lat': 35.8617, 'lng': 104.1954},
-        'Russia': {'lat': 61.5240, 'lng': 105.3188},
-        'India': {'lat': 20.5937, 'lng': 78.9629},
-        'Mexico': {'lat': 23.6345, 'lng': -102.5528},
-        'Argentina': {'lat': -38.4161, 'lng': -63.6167},
-        'Spain': {'lat': 40.4637, 'lng': -3.7492},
-        'Italy': {'lat': 41.8719, 'lng': 12.5674},
-        'Sweden': {'lat': 60.1282, 'lng': 18.6435},
-        'Norway': {'lat': 60.4720, 'lng': 8.4689},
-        'South Africa': {'lat': -30.5595, 'lng': 22.9375},
-        'Chile': {'lat': -35.6751, 'lng': -71.5430},
-        'Colombia': {'lat': 4.5709, 'lng': -74.2973},
-        'Peru': {'lat': -9.1900, 'lng': -75.0152},
-        'Venezuela': {'lat': 6.4238, 'lng': -66.5897},
-        'Netherlands': {'lat': 52.1326, 'lng': 5.2913},
-        'Belgium': {'lat': 50.5039, 'lng': 4.4699},
-        'Switzerland': {'lat': 46.8182, 'lng': 8.2275},
-        'Austria': {'lat': 47.5162, 'lng': 14.5501},
-        'Poland': {'lat': 51.9194, 'lng': 19.1451},
-        'Czech Republic': {'lat': 49.8175, 'lng': 15.4730},
-        'Denmark': {'lat': 56.2639, 'lng': 9.5018},
-        'Finland': {'lat': 61.9241, 'lng': 25.7482},
-        'Portugal': {'lat': 39.3999, 'lng': -8.2245},
-        'Greece': {'lat': 39.0742, 'lng': 21.8243},
-        'Turkey': {'lat': 38.9637, 'lng': 35.2433},
-        'Egypt': {'lat': 26.0975, 'lng': 31.2357},
-        'Morocco': {'lat': 31.7917, 'lng': -7.0926},
-        'Kenya': {'lat': -0.0236, 'lng': 37.9062},
-        'Tanzania': {'lat': -6.3690, 'lng': 34.8888},
-        'Nigeria': {'lat': 9.0820, 'lng': 8.6753},
-        'Ghana': {'lat': 7.9465, 'lng': -1.0232},
-        'Thailand': {'lat': 15.8700, 'lng': 100.9925},
-        'Malaysia': {'lat': 4.2105, 'lng': 101.9758},
-        'Singapore': {'lat': 1.3521, 'lng': 103.8198},
-        'Indonesia': {'lat': -0.7893, 'lng': 113.9213},
-        'Philippines': {'lat': 12.8797, 'lng': 121.7740},
-        'South Korea': {'lat': 35.9078, 'lng': 127.7669},
-        'New Zealand': {'lat': -40.9006, 'lng': 174.8860},
-        'Costa Rica': {'lat': 9.7489, 'lng': -83.7534},
-        'Panama': {'lat': 8.5380, 'lng': -80.7821},
-        'Ecuador': {'lat': -1.8312, 'lng': -78.1834},
-        'Bolivia': {'lat': -16.2902, 'lng': -63.5887},
-        'Uruguay': {'lat': -32.5228, 'lng': -55.7658},
-        'Paraguay': {'lat': -23.4425, 'lng': -58.4438}
-    }
+    result = db.execute(query, taxon_params).fetchall()
 
     map_data = []
     for row in result:
-        country = row[0]
-        coords = country_coords.get(country)
+        avg_lat = row[4]
+        avg_lng = row[5]
+        # Skip countries with no coordinate data at all
+        if avg_lat is None or avg_lng is None:
+            continue
 
-        if coords:
-            # Create a virtual "institution aggregation point" for each country
-            map_data.append({
-                'institutionCode': f"AGG_{country.upper().replace(' ', '_')}",
-                'institutionName': f"{country} Institutions",
-                'lat': coords['lat'] + (hash(country) % 100 - 50) * 0.01,  # Add small random offset to avoid overlap
-                'lng': coords['lng'] + (hash(country) % 100 - 50) * 0.01,
-                'recordCount': row[2],  # total_records
-                'country': country,
-                'institutionCount': row[1],  # institution_count
-                'avgGeoreferencing': round(row[3], 1) if row[3] else 0
-            })
+        map_data.append({
+            "country": row[0],
+            "institutionCount": row[1],
+            "recordCount": row[2],
+            "avgGeoreferencing": float(row[3]) if row[3] else 0,
+            "lat": round(float(avg_lat), 4),
+            "lng": round(float(avg_lng), 4),
+            "speciesCount": row[6] or 0
+        })
 
     return {"mapData": map_data}
 
@@ -3992,12 +3876,10 @@ async def get_taxon_top_species(
     field = field_mapping[taxon_type]
 
     query = text(f"""
-        SELECT scientificname, vernacularname, COUNT(*) as record_count,
-               COUNT(DISTINCT institutioncode) as institutions_count,
-               COUNT(DISTINCT country) as countries_count
-        FROM dbo.harvestedfn2 
-        WHERE {field} = :taxon_name AND scientificname IS NOT NULL AND scientificname != ''
-        GROUP BY scientificname, vernacularname
+        SELECT genus || ' ' || specificepithet as scientificname,
+               vernacularname, record_count, institutions_count, countries_count
+        FROM dbo.species_stats
+        WHERE {field} = :taxon_name
         ORDER BY record_count DESC
         LIMIT :limit
     """)
@@ -4010,9 +3892,9 @@ async def get_taxon_top_species(
             "rank": i,
             "name": row[0],
             "vernacularName": row[1] or "No common name",
-            "recordCount": row[2],
-            "institutionsCount": row[3],
-            "countriesCount": row[4]
+            "recordCount": row[2] or 0,
+            "institutionsCount": row[3] or 0,
+            "countriesCount": row[4] or 0
         })
 
     return {"topSpecies": top_species}
@@ -4033,7 +3915,7 @@ async def get_taxon_hierarchy(
         # For species, we expect full binomial name (genus + species)
         query = text("""
             SELECT DISTINCT kingdom, phylum, "class", "order", family, genus, specificepithet, scientificname
-            FROM dbo.harvestedfn2 
+            FROM dbo.harvestedfn2_fin 
             WHERE scientificname = :taxon_name OR CONCAT(genus, ' ', specificepithet) = :taxon_name
             LIMIT 1
         """)
@@ -4042,7 +3924,7 @@ async def get_taxon_hierarchy(
         field = field_mapping[taxon_type]
         query = text(f"""
             SELECT DISTINCT kingdom, phylum, "class", "order", family, genus, specificepithet, scientificname
-            FROM dbo.harvestedfn2 
+            FROM dbo.harvestedfn2_fin 
             WHERE {field} = :taxon_name
             LIMIT 1
         """)
@@ -4076,23 +3958,22 @@ async def get_taxon_institution_coverage(
     if taxon_type not in ["family", "genus", "species"]:
         raise HTTPException(status_code=400, detail="Invalid taxon type")
 
-    field_mapping = {"family": "family", "genus": "genus", "species": "scientificname"}
-    field = field_mapping[taxon_type]
+    taxon_condition, taxon_params = parse_taxon_filter(taxon_type, taxon_name)
 
     try:
         # 1. Geographic coverage analysis
         geographic_coverage_query = text(f"""
             WITH institution_countries AS (
-                SELECT institutioncode, 
-                       COUNT(DISTINCT country) as country_count,
+                SELECT institutioncode,
+                       COUNT(DISTINCT countrycode) as country_count,
                        COUNT(*) as total_records
-                FROM dbo.harvestedfn2 
-                WHERE {field} = :taxon_name 
+                FROM dbo.harvestedfn2_fin
+                WHERE {taxon_condition}
                   AND institutioncode IS NOT NULL AND institutioncode != ''
                   AND country IS NOT NULL AND country != ''
                 GROUP BY institutioncode
             )
-            SELECT 
+            SELECT
                 COUNT(CASE WHEN country_count >= 20 THEN 1 END) as global_coverage,
                 COUNT(CASE WHEN country_count BETWEEN 5 AND 19 THEN 1 END) as regional_specialists,
                 COUNT(CASE WHEN country_count < 5 THEN 1 END) as local_collections,
@@ -4100,7 +3981,7 @@ async def get_taxon_institution_coverage(
             FROM institution_countries
         """)
 
-        geographic_result = db.execute(geographic_coverage_query, {"taxon_name": taxon_name}).fetchone()
+        geographic_result = db.execute(geographic_coverage_query, taxon_params).fetchone()
 
         # 2. Taxonomic specialization analysis
         taxonomic_specialization_query = text(f"""
@@ -4108,14 +3989,14 @@ async def get_taxon_institution_coverage(
                 SELECT institutioncode,
                        COUNT(DISTINCT family) as family_count,
                        COUNT(DISTINCT genus) as genus_count,
-                       COUNT(DISTINCT scientificname) as species_count,
+                       COUNT(DISTINCT COALESCE(validname, scientificname)) as species_count,
                        COUNT(*) as total_records
-                FROM dbo.harvestedfn2 
-                WHERE {field} = :taxon_name 
+                FROM dbo.harvestedfn2_fin
+                WHERE {taxon_condition}
                   AND institutioncode IS NOT NULL AND institutioncode != ''
                 GROUP BY institutioncode
             )
-            SELECT 
+            SELECT
                 COUNT(CASE WHEN total_records >= 1000 THEN 1 END) as family_specialists,
                 COUNT(CASE WHEN genus_count <= 5 AND total_records >= 100 THEN 1 END) as genus_specialists,
                 COUNT(CASE WHEN species_count >= 10 AND genus_count >= 3 THEN 1 END) as regional_fauna_focus,
@@ -4123,7 +4004,7 @@ async def get_taxon_institution_coverage(
             FROM institution_taxonomy
         """)
 
-        taxonomic_result = db.execute(taxonomic_specialization_query, {"taxon_name": taxon_name}).fetchone()
+        taxonomic_result = db.execute(taxonomic_specialization_query, taxon_params).fetchone()
 
         # 3. Data quality analysis
         data_quality_query = text(f"""
@@ -4142,8 +4023,8 @@ async def get_taxon_institution_coverage(
                        ROUND(
                            COUNT(CASE WHEN collectioncode IS NOT NULL AND collectioncode != '' THEN 1 END) * 100.0 / COUNT(*), 2
                        ) as collection_quality
-                FROM dbo.harvestedfn2 
-                WHERE {field} = :taxon_name 
+                FROM dbo.harvestedfn2_fin
+                WHERE {taxon_condition}
                   AND institutioncode IS NOT NULL AND institutioncode != ''
                 GROUP BY institutioncode
             ),
@@ -4153,7 +4034,7 @@ async def get_taxon_institution_coverage(
                        (geo_quality + date_quality + taxonomy_quality + collection_quality) / 4 as overall_score
                 FROM institution_quality
             )
-            SELECT 
+            SELECT
                 COUNT(CASE WHEN overall_score > 95 THEN 1 END) as high_quality,
                 COUNT(CASE WHEN overall_score BETWEEN 85 AND 95 THEN 1 END) as good_quality,
                 COUNT(CASE WHEN overall_score < 85 THEN 1 END) as improving_quality,
@@ -4162,20 +4043,20 @@ async def get_taxon_institution_coverage(
             FROM overall_quality
         """)
 
-        quality_result = db.execute(data_quality_query, {"taxon_name": taxon_name}).fetchone()
+        quality_result = db.execute(data_quality_query, taxon_params).fetchone()
 
         # 4. Collection size analysis
         collection_scale_query = text(f"""
             WITH institution_scale AS (
                 SELECT institutioncode,
                        COUNT(*) as record_count,
-                       COUNT(DISTINCT scientificname) as species_count
-                FROM dbo.harvestedfn2 
-                WHERE {field} = :taxon_name 
+                       COUNT(DISTINCT COALESCE(validname, scientificname)) as species_count
+                FROM dbo.harvestedfn2_fin
+                WHERE {taxon_condition}
                   AND institutioncode IS NOT NULL AND institutioncode != ''
                 GROUP BY institutioncode
             )
-            SELECT 
+            SELECT
                 COUNT(CASE WHEN record_count > 10000 THEN 1 END) as major_collections,
                 COUNT(CASE WHEN record_count BETWEEN 1000 AND 10000 THEN 1 END) as substantial_collections,
                 COUNT(CASE WHEN record_count BETWEEN 100 AND 999 THEN 1 END) as moderate_collections,
@@ -4185,26 +4066,26 @@ async def get_taxon_institution_coverage(
             FROM institution_scale
         """)
 
-        scale_result = db.execute(collection_scale_query, {"taxon_name": taxon_name}).fetchone()
+        scale_result = db.execute(collection_scale_query, taxon_params).fetchone()
 
         # 5. Institution type analysis (based on institution code patterns)
         institution_type_query = text(f"""
             WITH institution_types AS (
                 SELECT institutioncode,
                        COUNT(*) as record_count,
-                       CASE 
+                       CASE
                            WHEN institutioncode ILIKE '%MNH%' OR institutioncode ILIKE '%MUSEUM%' OR institutioncode ILIKE '%MUS%' THEN 'museum'
                            WHEN institutioncode ILIKE '%UNIV%' OR institutioncode ILIKE '%UNI%' OR institutioncode ILIKE '%COLL%' THEN 'university'
                            WHEN institutioncode ILIKE '%GOV%' OR institutioncode ILIKE '%USGS%' OR institutioncode ILIKE '%NOAA%' THEN 'government'
                            WHEN institutioncode ILIKE '%ACAD%' OR institutioncode ILIKE '%INST%' THEN 'research'
                            ELSE 'private'
                        END as institution_type
-                FROM dbo.harvestedfn2 
-                WHERE {field} = :taxon_name 
+                FROM dbo.harvestedfn2_fin
+                WHERE {taxon_condition}
                   AND institutioncode IS NOT NULL AND institutioncode != ''
                 GROUP BY institutioncode
             )
-            SELECT 
+            SELECT
                 institution_type,
                 COUNT(*) as institution_count,
                 SUM(record_count) as total_records,
@@ -4214,7 +4095,7 @@ async def get_taxon_institution_coverage(
             ORDER BY institution_count DESC
         """)
 
-        type_result = db.execute(institution_type_query, {"taxon_name": taxon_name}).fetchall()
+        type_result = db.execute(institution_type_query, taxon_params).fetchall()
 
         # 6. Temporal activity analysis
         temporal_activity_query = text(f"""
@@ -4225,22 +4106,22 @@ async def get_taxon_institution_coverage(
                        MAX(CASE WHEN year IS NOT NULL AND year > 1800 THEN year END) as latest_year,
                        COUNT(CASE WHEN year >= 2020 THEN 1 END) as recent_records,
                        COUNT(CASE WHEN year BETWEEN 2010 AND 2019 THEN 1 END) as decade_records
-                FROM dbo.harvestedfn2 
-                WHERE {field} = :taxon_name 
+                FROM dbo.harvestedfn2_fin
+                WHERE {taxon_condition}
                   AND institutioncode IS NOT NULL AND institutioncode != ''
                 GROUP BY institutioncode
             )
-            SELECT 
+            SELECT
                 COUNT(CASE WHEN recent_records > 0 THEN 1 END) as recently_active,
                 COUNT(CASE WHEN decade_records > 0 AND recent_records = 0 THEN 1 END) as historically_active,
                 COUNT(CASE WHEN latest_year < 2010 OR latest_year IS NULL THEN 1 END) as inactive,
-                ROUND(AVG(CASE WHEN latest_year IS NOT NULL AND earliest_year IS NOT NULL 
+                ROUND(AVG(CASE WHEN latest_year IS NOT NULL AND earliest_year IS NOT NULL
                               THEN latest_year - earliest_year ELSE NULL END), 1) as avg_collection_span,
                 COUNT(*) as total_institutions
             FROM institution_activity
         """)
 
-        activity_result = db.execute(temporal_activity_query, {"taxon_name": taxon_name}).fetchone()
+        activity_result = db.execute(temporal_activity_query, taxon_params).fetchone()
 
         # Assemble results
         institution_types_breakdown = {}

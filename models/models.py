@@ -11,7 +11,7 @@ Base = declarative_base()
 
 # SQLAlchemy models
 class HarvestedRecord(Base):
-    __tablename__ = "harvestedfn2"
+    __tablename__ = "harvestedfn2_fin"
     __table_args__ = {"schema": "dbo"}
 
     # Use catalognumber as primary key, add ID field if not present
