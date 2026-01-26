@@ -114,7 +114,7 @@ FIELD_MAPPING = {
 # Only SELECT the columns we actually need
 # Quote reserved words (order, class, etc.)
 PG_RESERVED = {"order", "class", "year", "month", "day", "references"}
-SELECT_COLUMNS = ", ".join(
+SELECT_COLUMNS = "id, " + ", ".join(
     f'"{col}"' if col in PG_RESERVED else col
     for col in FIELD_MAPPING.keys()
 )
@@ -260,14 +260,14 @@ def generate_actions(db_session, batch_size=10000):
     total_count = db_session.execute(count_query).scalar()
     print(f"Total records: {total_count}")
 
-    last_id = ''
+    last_id = 0
     processed = 0
 
     while True:
         query = text(f'''
             SELECT {SELECT_COLUMNS} FROM dbo.harvestedfn2_fin
-            WHERE catalognumber > :last_id
-            ORDER BY catalognumber
+            WHERE id > :last_id
+            ORDER BY id
             LIMIT :batch_size
         ''')
 
@@ -283,12 +283,12 @@ def generate_actions(db_session, batch_size=10000):
             if doc:
                 yield {
                     "_index": INDEX_NAME,
-                    "_id": record.get("catalognumber"),
+                    "_id": record["id"],
                     "_source": doc
                 }
                 processed += 1
 
-            last_id = record.get("catalognumber")
+            last_id = record["id"]
 
         pct = processed * 100 // total_count if total_count else 0
         print(f"Processed: {processed}/{total_count} ({pct}%)")
