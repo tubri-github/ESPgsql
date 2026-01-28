@@ -29,10 +29,19 @@ if settings.ES_USER and settings.ES_PASSWORD:
     es = Elasticsearch(
         settings.ES_URL,
         basic_auth=(settings.ES_USER, settings.ES_PASSWORD),
-        verify_certs=False
+        verify_certs=False,
+        request_timeout=120,
+        retry_on_timeout=True,
+        max_retries=3
     )
 else:
-    es = Elasticsearch(settings.ES_URL, verify_certs=False)
+    es = Elasticsearch(
+        settings.ES_URL,
+        verify_certs=False,
+        request_timeout=120,
+        retry_on_timeout=True,
+        max_retries=3
+    )
 
 # Database connection
 engine = create_engine(settings.DATABASE_URL)
@@ -110,6 +119,10 @@ FIELD_MAPPING = {
     "associatedmedia": "AssociatedMedia",
     "datasetname": "DatasetName",
 }
+
+# Numeric fields that need type coercion
+LONG_FIELDS = {"individualcount", "year", "month", "day"}
+FLOAT_FIELDS = {"decimallatitude", "decimallongitude"}
 
 # Only SELECT the columns we actually need
 # Quote reserved words (order, class, etc.)
@@ -248,8 +261,21 @@ def transform_record(record):
     for db_field, es_field in FIELD_MAPPING.items():
         value = record.get(db_field)
         if value is not None:
-            if isinstance(value, str) and value.strip() == "":
-                continue
+            if isinstance(value, str):
+                value = value.strip()
+                if value == "":
+                    continue
+                # Coerce numeric string fields (e.g. "1,899" -> 1899)
+                if db_field in LONG_FIELDS:
+                    try:
+                        value = int(value.replace(",", ""))
+                    except (ValueError, AttributeError):
+                        continue  # Skip unparseable values like UUIDs
+                elif db_field in FLOAT_FIELDS:
+                    try:
+                        value = float(value.replace(",", ""))
+                    except (ValueError, AttributeError):
+                        continue
             doc[es_field] = value
     return doc
 
@@ -262,6 +288,7 @@ def generate_actions(db_session, batch_size=10000):
 
     last_id = 0
     processed = 0
+    skipped_ids = []
 
     while True:
         query = text(f'''
@@ -287,11 +314,19 @@ def generate_actions(db_session, batch_size=10000):
                     "_source": doc
                 }
                 processed += 1
+            else:
+                skipped_ids.append(record["id"])
 
             last_id = record["id"]
 
-        pct = processed * 100 // total_count if total_count else 0
-        print(f"Processed: {processed}/{total_count} ({pct}%)")
+        pct = (processed + len(skipped_ids)) * 100 // total_count if total_count else 0
+        print(f"Processed: {processed}/{total_count} ({pct}%) [skipped {len(skipped_ids)} empty records]")
+
+    if skipped_ids:
+        print(f"\n--- Skipped {len(skipped_ids)} empty records, IDs written to skipped_ids.txt ---")
+        with open("skipped_ids.txt", "w") as f:
+            for sid in skipped_ids:
+                f.write(f"{sid}\n")
 
 
 def sync_data():
@@ -303,6 +338,7 @@ def sync_data():
 
         success = 0
         failed = 0
+        error_samples = []  # Collect first N error samples for diagnosis
         for ok, item in parallel_bulk(
             es,
             generate_actions(db),
@@ -315,6 +351,14 @@ def sync_data():
                 success += 1
             else:
                 failed += 1
+                if len(error_samples) < 20:
+                    error_samples.append(item)
+
+        if error_samples:
+            print(f"\n--- First {len(error_samples)} error samples ---")
+            for i, err in enumerate(error_samples, 1):
+                print(f"  [{i}] {err}")
+            print("---")
 
         elapsed = time.time() - start_time
         print(f"\nSync completed in {elapsed:.1f}s")
