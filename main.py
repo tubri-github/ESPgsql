@@ -1123,7 +1123,22 @@ async def adsearch(payload: SearchPayload):
                         "filter": filter_clauses
                     }
                 }
-        # response = es.search(index=settings.ES_INDEX, body=es_query)
+
+        # Sort: push records with empty ScientificName to the bottom
+        es_query["sort"] = [
+            {
+                "_script": {
+                    "type": "number",
+                    "script": {
+                        "source": "doc.containsKey('ScientificName.keyword') && doc['ScientificName.keyword'].size() > 0 && doc['ScientificName.keyword'].value.length() > 0 ? 1 : 0",
+                        "lang": "painless"
+                    },
+                    "order": "desc"
+                }
+            },
+            "_score"
+        ]
+
         response = es.search(index=settings.ES_INDEX, body=es_query)
         hits = response["hits"]["hits"]
         total = response["hits"]["total"]["value"]
