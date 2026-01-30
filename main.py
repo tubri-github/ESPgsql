@@ -2073,6 +2073,251 @@ async def get_institutions(
         pages=(total + params.per_page - 1) // params.per_page
     )
 
+
+# ============================================================
+# Institution V2 API - With Survey Details
+# ============================================================
+
+@app.get("/institutions/v2", response_model=PaginatedResponse)
+async def get_institutions_v2(
+        params: InstitutionFilterParams = Depends(),
+        db: Session = Depends(get_db)
+):
+    """Get institutions with survey details (v2 test endpoint)"""
+    base_select = """
+        SELECT
+            s.institutioncode, s.institution_name, s.ownerinstitutioncode,
+            s.country as stats_country, s.region, s.institution_type,
+            s.record_count, s.species_count, s.families_count, s.countries_count,
+            s.georeferencing_quality, s.date_quality, s.taxonomic_quality,
+            s.overall_quality, s.first_record, s.latest_record,
+            d.official_name, d.alternate_name, d.abbreviation_name,
+            d.address, d.city, d.state, d.country as detail_country, d.zip,
+            d.phone, d.email, d.website,
+            d.latitude, d.longitude,
+            d.sns_twitter, d.sns_facebook, d.sns_instagram,
+            d.environment, d.specimens_amount, d.data_url,
+            d.source
+        FROM dbo.institution_stats s
+        LEFT JOIN dbo.institution_details d ON s.institutioncode = d.institution_code
+    """
+
+    conditions = []
+    params_dict = {}
+
+    if params.search:
+        conditions.append("""
+            (s.institutioncode ILIKE :search
+             OR s.institution_name ILIKE :search
+             OR s.country ILIKE :search
+             OR d.official_name ILIKE :search
+             OR d.city ILIKE :search)
+        """)
+        params_dict["search"] = f"%{params.search}%"
+
+    if params.region:
+        conditions.append("s.region = :region_filter")
+        params_dict["region_filter"] = params.region
+
+    if params.institution_type:
+        conditions.append("s.institution_type = :type_filter")
+        params_dict["type_filter"] = params.institution_type
+
+    if params.record_count:
+        if params.record_count == "major":
+            conditions.append("s.record_count > 10000")
+        elif params.record_count == "medium":
+            conditions.append("s.record_count BETWEEN 1000 AND 10000")
+        elif params.record_count == "small":
+            conditions.append("s.record_count < 1000")
+
+    where_clause = ""
+    if conditions:
+        where_clause = " WHERE " + " AND ".join(conditions)
+
+    sort_mapping = {
+        "records_desc": "s.record_count DESC",
+        "species_desc": "s.species_count DESC",
+        "quality_desc": "s.overall_quality DESC",
+        "name_asc": "COALESCE(d.official_name, s.institution_name) ASC"
+    }
+    order_by = sort_mapping.get(params.sort_by, "s.record_count DESC")
+
+    data_query = text(base_select + where_clause + f" ORDER BY {order_by} LIMIT :limit OFFSET :offset")
+    count_query = text(f"""
+        SELECT COUNT(*) FROM dbo.institution_stats s
+        LEFT JOIN dbo.institution_details d ON s.institutioncode = d.institution_code
+        {where_clause}
+    """)
+
+    params_dict.update({
+        "limit": params.per_page,
+        "offset": (params.page - 1) * params.per_page
+    })
+
+    total = db.execute(count_query, {k: v for k, v in params_dict.items() if k not in ['limit', 'offset']}).scalar()
+    result = db.execute(data_query, params_dict).fetchall()
+
+    institutions = []
+    for row in result:
+        institutions.append({
+            # Stats data
+            "institutionCode": row[0],
+            "institutionName": row[16] or row[1],  # Prefer official_name from details
+            "ownerInstitutionCode": row[2],
+            "statsCountry": row[3],  # Country from stats (specimen locations)
+            "region": row[4],
+            "institutionType": row[5],
+            "recordCount": row[6] or 0,
+            "speciesCount": row[7] or 0,
+            "familiesCount": row[8] or 0,
+            "countriesCount": row[9] or 0,
+            "geoReferencingQuality": float(row[10]) if row[10] else 0.0,
+            "dateQuality": float(row[11]) if row[11] else 0.0,
+            "taxonomicQuality": float(row[12]) if row[12] else 0.0,
+            "overallQuality": float(row[13]) if row[13] else 0.0,
+            "firstRecord": row[14],
+            "latestRecord": row[15],
+            # Details data
+            "officialName": row[16],
+            "alternateName": row[17],
+            "abbreviationName": row[18],
+            "address": row[19],
+            "city": row[20],
+            "state": row[21],
+            "country": row[22],  # Institution physical location
+            "zip": row[23],
+            "phone": row[24],
+            "email": row[25],
+            "website": row[26],
+            "latitude": float(row[27]) if row[27] else None,
+            "longitude": float(row[28]) if row[28] else None,
+            "twitter": row[29],
+            "facebook": row[30],
+            "instagram": row[31],
+            "environment": row[32],
+            "specimensAmount": row[33],
+            "dataUrl": row[34],
+            "source": row[35]
+        })
+
+    return PaginatedResponse(
+        data=institutions,
+        page=params.page,
+        per_page=params.per_page,
+        total=total,
+        pages=(total + params.per_page - 1) // params.per_page
+    )
+
+
+@app.get("/institutions/v2/{institution_code}")
+async def get_institution_detail_v2(institution_code: str, db: Session = Depends(get_db)):
+    """Get institution details with survey data and contacts (v2 test endpoint)"""
+    query = text("""
+        SELECT
+            s.institutioncode, s.institution_name, s.ownerinstitutioncode,
+            s.country as stats_country, s.region, s.institution_type,
+            s.record_count, s.species_count, s.families_count, s.countries_count,
+            s.georeferencing_quality, s.date_quality, s.taxonomic_quality,
+            s.overall_quality, s.first_record, s.latest_record,
+            d.official_name, d.alternate_name, d.abbreviation_name,
+            d.address, d.city, d.state, d.country as detail_country, d.zip,
+            d.phone, d.email, d.website,
+            d.latitude, d.longitude,
+            d.sns_twitter, d.sns_facebook, d.sns_instagram, d.sns_other,
+            d.preparation_type, d.environment, d.specimens_amount, d.establish_time,
+            d.data_url, d.data_format,
+            d.primary_type_lots, d.secondary_type_lots, d.genetic_resources,
+            d.source, d.survey_collection_id, d.gbif_link
+        FROM dbo.institution_stats s
+        LEFT JOIN dbo.institution_details d ON s.institutioncode = d.institution_code
+        WHERE s.institutioncode = :institution_code
+    """)
+
+    result = db.execute(query, {"institution_code": institution_code}).fetchone()
+
+    if not result:
+        raise HTTPException(status_code=404, detail="Institution not found")
+
+    # Fetch contacts for this institution
+    contacts_query = text("""
+        SELECT first_name, last_name, title, contact_type,
+               phone, email, address, city, state, country, zip
+        FROM dbo.institution_contacts
+        WHERE institution_code = :institution_code
+        ORDER BY id
+    """)
+    contacts_result = db.execute(contacts_query, {"institution_code": institution_code}).fetchall()
+
+    contacts = []
+    for contact in contacts_result:
+        contacts.append({
+            "firstName": contact[0],
+            "lastName": contact[1],
+            "title": contact[2],
+            "contactType": contact[3],
+            "phone": contact[4],
+            "email": contact[5],
+            "address": contact[6],
+            "city": contact[7],
+            "state": contact[8],
+            "country": contact[9],
+            "zip": contact[10]
+        })
+
+    return {
+        # Stats data
+        "institutionCode": result[0],
+        "institutionName": result[16] or result[1],
+        "ownerInstitutionCode": result[2],
+        "statsCountry": result[3],
+        "region": result[4],
+        "institutionType": result[5],
+        "recordCount": result[6] or 0,
+        "speciesCount": result[7] or 0,
+        "familiesCount": result[8] or 0,
+        "countriesCount": result[9] or 0,
+        "geoReferencingQuality": float(result[10]) if result[10] else 0.0,
+        "dateQuality": float(result[11]) if result[11] else 0.0,
+        "taxonomicQuality": float(result[12]) if result[12] else 0.0,
+        "overallQuality": float(result[13]) if result[13] else 0.0,
+        "firstRecord": result[14],
+        "latestRecord": result[15],
+        # Details data
+        "officialName": result[16],
+        "alternateName": result[17],
+        "abbreviationName": result[18],
+        "address": result[19],
+        "city": result[20],
+        "state": result[21],
+        "country": result[22],
+        "zip": result[23],
+        "phone": result[24],
+        "email": result[25],
+        "website": result[26],
+        "latitude": float(result[27]) if result[27] else None,
+        "longitude": float(result[28]) if result[28] else None,
+        "twitter": result[29],
+        "facebook": result[30],
+        "instagram": result[31],
+        "otherSocial": result[32],
+        "preparationType": result[33],
+        "environment": result[34],
+        "specimensAmount": result[35],
+        "establishTime": result[36],
+        "dataUrl": result[37],
+        "dataFormat": result[38],
+        "primaryTypeLots": result[39],
+        "secondaryTypeLots": result[40],
+        "geneticResources": result[41],
+        "source": result[42],
+        "surveyCollectionId": result[43],
+        "gbifLink": result[44],
+        # Contacts
+        "contacts": contacts
+    }
+
+
 @app.get("/institutions/{institution_code}")
 async def get_institution_detail(institution_code: str, db: Session = Depends(get_db)):
     """Get institution details"""
@@ -2119,7 +2364,7 @@ async def get_records(
     """Get records"""
     base_select = """
         SELECT catalognumber, scientificname, vernacularname, family, genus,
-               scientificnameauthorship, recordedby, eventdate, country, 
+               scientificnameauthorship, recordedby, eventdate, country,
                locality, decimallatitude, decimallongitude, institutioncode,
                collectioncode, basisofrecord, geo_quality, date_quality
         FROM dbo.record_details
@@ -2912,21 +3157,105 @@ async def get_records_by_institution_v2(
         pages=(total + per_page - 1) // per_page
     )
 
+
+@app.get("/institutions/{institution_code}/species")
+async def get_institution_species(
+        institution_code: str,
+        page: int = Query(1, ge=1),
+        per_page: int = Query(50, ge=1, le=200),
+        search: Optional[str] = None,
+        sort_by: str = "records_desc",
+        db: Session = Depends(get_db)
+):
+    """Get species list for a specific institution with record counts"""
+
+    base_query = """
+        SELECT COALESCE(validname, scientificname) as species_name,
+               family,
+               COUNT(*) as record_count,
+               COUNT(DISTINCT countrycode) as countries_count
+        FROM dbo.harvestedfn2_fin
+        WHERE institutioncode = :institution_code
+          AND COALESCE(validname, scientificname) IS NOT NULL
+          AND COALESCE(validname, scientificname) != ''
+    """
+
+    conditions = []
+    params = {"institution_code": institution_code}
+
+    if search:
+        conditions.append("""
+            (COALESCE(validname, scientificname) ILIKE :search OR family ILIKE :search)
+        """)
+        params["search"] = f"%{search}%"
+
+    if conditions:
+        base_query += " AND " + " AND ".join(conditions)
+
+    base_query += " GROUP BY COALESCE(validname, scientificname), family"
+
+    # Sorting
+    sort_mapping = {
+        "records_desc": "record_count DESC",
+        "records_asc": "record_count ASC",
+        "name_asc": "species_name ASC",
+        "name_desc": "species_name DESC",
+        "family_asc": "family ASC, species_name ASC"
+    }
+    order_clause = sort_mapping.get(sort_by, "record_count DESC")
+
+    # Count query
+    count_query = text(f"""
+        SELECT COUNT(*) FROM (
+            {base_query}
+        ) as species_count
+    """)
+
+    # Data query with pagination
+    data_query = text(f"""
+        {base_query}
+        ORDER BY {order_clause}
+        LIMIT :limit OFFSET :offset
+    """)
+
+    params["limit"] = per_page
+    params["offset"] = (page - 1) * per_page
+
+    total = db.execute(count_query, {k: v for k, v in params.items() if k not in ['limit', 'offset']}).scalar() or 0
+    result = db.execute(data_query, params).fetchall()
+
+    species_list = []
+    for row in result:
+        species_list.append({
+            "scientificName": row[0],
+            "family": row[1],
+            "recordCount": row[2],
+            "countriesCount": row[3]
+        })
+
+    return {
+        "data": species_list,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "pages": (total + per_page - 1) // per_page
+    }
+
+
 @app.get("/institution/stats")
 async def get_institutions_stats(db: Session = Depends(get_db)):
     """Get institution statistics - fixed version"""
 
-    # 1. Basic statistics - each institution counted only once
+    # 1. Basic statistics - count all institutions
     basic_stats_query = text("""
         SELECT
             COUNT(*) as total_institutions,
-            SUM(array_length(collection_codes, 1)) as total_collection_codes,
+            (SELECT SUM(array_length(collection_codes, 1)) FROM dbo.institution_stats WHERE collection_codes IS NOT NULL) as total_collection_codes,
             SUM(record_count) as total_records,
             (SELECT COUNT(DISTINCT country) FROM dbo.institution_country_distribution) as total_countries,
             ROUND(AVG(georeferencing_quality), 1) as avg_georeferencing,
             ROUND(AVG(date_quality), 1) as avg_date_quality
         FROM dbo.institution_stats
-        WHERE collection_codes IS NOT NULL
     """)
 
     basic_result = db.execute(basic_stats_query).fetchone()
@@ -2985,9 +3314,9 @@ async def get_institutions_stats(db: Session = Depends(get_db)):
 
     return {
         # Basic statistics
-        "totalInstitutions": 92,  # TODO: fix institution_stats view (collection_codes NULL issue)
+        "totalInstitutions": basic_result[0] or 0,
         "totalCollectionCodes": basic_result[1] or 0,
-        "totalRecords": 7459135,  # TODO: fix after institution_stats rebuild
+        "totalRecords": basic_result[2] or 0,
         "totalCountries": basic_result[3] or 0,
         "avgGeoreferenced": float(basic_result[4]) if basic_result[4] else 0.0,
         "avgDateQuality": float(basic_result[5]) if basic_result[5] else 0.0,
@@ -3217,13 +3546,75 @@ async def get_taxon_map_points(
     }
 
 
+@app.get("/institutions/{institution_code}/map-points")
+async def get_institution_map_points(
+        institution_code: str,
+        south: Optional[float] = Query(None, description="South bound latitude"),
+        north: Optional[float] = Query(None, description="North bound latitude"),
+        west: Optional[float] = Query(None, description="West bound longitude"),
+        east: Optional[float] = Query(None, description="East bound longitude"),
+        zoom: Optional[int] = Query(None, description="Map zoom level (1-18), controls grid precision"),
+        db: Session = Depends(get_db)
+):
+    """Return coordinate points for institution heatmap rendering.
+    Grid precision adapts to zoom level.
+    Returns [[lat, lng, weight], ...] — weight = record count at that grid cell.
+    """
+    # Determine grid precision based on zoom level
+    if zoom is None or zoom <= 3:
+        precision = 0  # ~111km grid
+    elif zoom <= 6:
+        precision = 1  # ~11km grid
+    else:
+        precision = 2  # ~1km grid
+
+    query_params = {"institution_code": institution_code}
+
+    # Viewport bounds filter
+    bounds_condition = ""
+    if south is not None and north is not None and west is not None and east is not None:
+        bounds_condition = " AND decimallatitude BETWEEN :south AND :north AND decimallongitude BETWEEN :west AND :east"
+        query_params.update({"south": south, "north": north, "west": west, "east": east})
+
+    max_points = 50000
+
+    query = text(f"""
+        SELECT ROUND(decimallatitude::numeric, {precision}) as lat,
+               ROUND(decimallongitude::numeric, {precision}) as lng,
+               COUNT(*) as weight
+        FROM dbo.harvestedfn2_fin
+        WHERE institutioncode = :institution_code
+          AND decimallatitude IS NOT NULL
+          AND decimallongitude IS NOT NULL
+          {bounds_condition}
+        GROUP BY ROUND(decimallatitude::numeric, {precision}), ROUND(decimallongitude::numeric, {precision})
+        ORDER BY weight DESC
+        LIMIT {max_points}
+    """)
+
+    result = db.execute(query, query_params).fetchall()
+
+    total_records = 0
+    points = []
+    for row in result:
+        w = int(row[2])
+        total_records += w
+        points.append([float(row[0]), float(row[1]), w])
+
+    return {
+        "points": points,
+        "total": len(points),
+        "totalRecords": total_records
+    }
+
+
 # Taxonomy hierarchy endpoints
 
 @app.get("/families/{family_name}/children")
 async def get_family_children(
         family_name: str,
         page: int = Query(1, ge=1),
-        per_page: int = Query(20, ge=1, le=100),
+        per_page: int = Query(50, ge=1, le=200),
         search: Optional[str] = None,
         sort_by: str = "records_desc",
         db: Session = Depends(get_db)
@@ -3295,7 +3686,7 @@ async def get_family_children(
 async def get_genus_children(
         genus_name: str,
         page: int = Query(1, ge=1),
-        per_page: int = Query(20, ge=1, le=100),
+        per_page: int = Query(50, ge=1, le=200),
         search: Optional[str] = None,
         sort_by: str = "records_desc",
         db: Session = Depends(get_db)

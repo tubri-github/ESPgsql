@@ -276,6 +276,79 @@ class InstitutionFilterParams(PaginationParams):
     sort_by: str = "records_desc"
 
 
+class InstitutionContact(BaseModel):
+    """Contact person for an institution."""
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    title: Optional[str] = None
+    contact_type: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    country: Optional[str] = None
+    zip: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class InstitutionDetailResponse(BaseModel):
+    """Extended institution response with survey details."""
+    # From institution_stats (statistics)
+    institution_code: str
+    record_count: int = 0
+    species_count: int = 0
+    families_count: int = 0
+    countries_count: int = 0
+    georeferencing_quality: float = 0.0
+    date_quality: float = 0.0
+    taxonomic_quality: float = 0.0
+    overall_quality: float = 0.0
+    collection_codes: List[str] = []
+    first_record: Optional[str] = None
+    latest_record: Optional[str] = None
+    stats_country: Optional[str] = None  # Country from stats (specimen collection locations)
+    region: Optional[str] = None
+    institution_type: Optional[str] = None
+
+    # From institution_details (survey metadata)
+    official_name: Optional[str] = None
+    alternate_name: Optional[str] = None
+    abbreviation_name: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    country: Optional[str] = None  # Institution physical location
+    zip: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    website: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    sns_twitter: Optional[str] = None
+    sns_facebook: Optional[str] = None
+    sns_instagram: Optional[str] = None
+    sns_other: Optional[str] = None
+    preparation_type: Optional[str] = None
+    environment: Optional[str] = None
+    specimens_amount: Optional[int] = None
+    establish_time: Optional[str] = None
+    data_url: Optional[str] = None
+    data_format: Optional[str] = None
+    primary_type_lots: Optional[bool] = None
+    secondary_type_lots: Optional[bool] = None
+    genetic_resources: Optional[str] = None
+    source: Optional[str] = None
+
+    # Contacts (from institution_contacts)
+    contacts: List[InstitutionContact] = []
+
+    class Config:
+        from_attributes = True
+
+
 class RecordFilterParams(PaginationParams):
     search: Optional[str] = None
     year: Optional[int] = None
