@@ -30,15 +30,15 @@ class Config(BaseSettings):
     TEMPLATE_DIR: str = os.path.join(STATIC_DIR, "templates")
 
     # cors request
-    CORS_ORIGINS: List[str] = Field(default_factory=lambda: ["*"])
+    CORS_ORIGINS: List[str] = Field(default_factory=lambda: [
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+    ])
     CORS_ALLOW_CREDENTIALS: bool = True
     CORS_ALLOW_METHODS: List[str] = Field(default_factory=lambda: ["*"])
     CORS_ALLOW_HEADERS: List[str] = Field(default_factory=lambda: ["*"])
-
-    # Session
-    SECRET_KEY: str = os.getenv('SECRET_KEY', 'session')
-    SESSION_COOKIE: str = "session_id"
-    SESSION_MAX_AGE: int = 14 * 24 * 60 * 60
 
     # Database
     DATABASE_URL: str = os.getenv('DATABASE_URL', 'postgresql://postgres:password@localhost:5432/fn2_legacy')

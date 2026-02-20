@@ -306,7 +306,7 @@ from config import settings
 from elasticsearch import Elasticsearch
 from auth_client import (
     init_auth, AuthConfig, get_current_user, get_current_user_optional,
-    UserInfo, handle_sso_callback, require_permissions
+    UserInfo, require_permissions
 )
 from models.models import (
     HarvestedRecord, FamilyResponse, GenusResponse, SpeciesResponse,
@@ -372,7 +372,7 @@ async def clear_cache():
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
-    # allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
+    allow_credentials=True,
     allow_methods=settings.CORS_ALLOW_METHODS,
     allow_headers=settings.CORS_ALLOW_HEADERS,
     expose_headers=["Content-Disposition"],
