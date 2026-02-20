@@ -198,7 +198,7 @@ def filter_by_geo(hits: list, geo_filter) -> list:
 
 # ============== End of Geo-spatial Utility Functions ==============
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, func, text, desc, asc
 from typing import List, Optional, Dict
 
@@ -304,6 +304,10 @@ def get_all_variations(normalized_value: str, field_name: str) -> list:
     return list(set(variations))  # Remove duplicates
 from config import settings
 from elasticsearch import Elasticsearch
+from auth_client import (
+    init_auth, AuthConfig, get_current_user, get_current_user_optional,
+    UserInfo, handle_sso_callback, require_permissions
+)
 from models.models import (
     HarvestedRecord, FamilyResponse, GenusResponse, SpeciesResponse,
     InstitutionResponse, RecordResponse, TaxonomyStatsResponse,
@@ -346,6 +350,13 @@ app = FastAPI(
     version="Beta 1.2",
     docs_url="/docs",
     redoc_url="/redoc",)
+
+# Initialize SSO authentication
+init_auth(AuthConfig(
+    auth_center_url="http://localhost:8010",
+    project_code="FN2",
+    current_domain="http://localhost:8000"
+))
 
 origins = [
     "http://localhost:5173",
@@ -1270,7 +1281,11 @@ async def adsearch(payload: SearchPayload):
         ]
 
         # Extract hits data, normalize fields for consistency
-        hits_data = [normalize_document(hit["_source"]) for hit in hits]
+        hits_data = [normalize_document({
+            "id": hit["_id"],
+            "score": hit.get("_score", 0),
+            **hit["_source"]
+        }) for hit in hits]
 
         # If geo_filter exists, perform precise polygon/circle filtering
         if geo_filter and geo_filter.coordinates:
@@ -4705,3 +4720,324 @@ async def get_taxon_institution_coverage(
                 "totalInstitutions": 0
             }
         }
+
+
+# ============== Record Flags ==============
+
+class RecordFlagCreate(BaseModel):
+    """Request model for creating a record flag"""
+    es_document_id: Optional[str] = None
+    catalog_number: Optional[str] = None
+    institution_code: str
+    scientific_name: Optional[str] = None
+    message: str = Field(..., min_length=1, max_length=2000)
+
+class RecordFlagProviderReply(BaseModel):
+    """Request model for provider responding to a flag"""
+    response: str = Field(..., min_length=1, max_length=2000)
+    new_status: str = Field(default="resolved")
+
+class RecordFlagReplyCreate(BaseModel):
+    """Request model for posting a reply in a flag conversation"""
+    message: str = Field(..., min_length=1, max_length=2000)
+
+
+@app.post("/flags/record", tags=["Record Flags"], summary="Create a record flag")
+async def create_record_flag(
+    flag_data: RecordFlagCreate,
+    db: Session = Depends(get_db),
+    user: UserInfo = Depends(get_current_user)
+):
+    """User flags a search result record and sends a message to the data provider."""
+    try:
+        # Check for duplicate active flag
+        dup_query = text("""
+            SELECT id FROM record_flags
+            WHERE user_id = :user_id
+              AND es_document_id = :es_document_id
+              AND institution_code = :institution_code
+              AND status = 'open'
+            LIMIT 1
+        """)
+        existing = db.execute(dup_query, {
+            "user_id": user.user_id,
+            "es_document_id": flag_data.es_document_id or "",
+            "institution_code": flag_data.institution_code
+        }).fetchone()
+
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail="You already have an open flag for this record"
+            )
+
+        insert_query = text("""
+            INSERT INTO record_flags
+                (user_id, username, user_email, es_document_id, catalog_number,
+                 institution_code, scientific_name, message)
+            VALUES
+                (:user_id, :username, :user_email, :es_document_id, :catalog_number,
+                 :institution_code, :scientific_name, :message)
+            RETURNING id, user_id, username, user_email, es_document_id, catalog_number,
+                      institution_code, scientific_name, message, provider_response,
+                      provider_user_id, provider_username, responded_at, status,
+                      created_at, updated_at
+        """)
+        result = db.execute(insert_query, {
+            "user_id": user.user_id,
+            "username": user.username,
+            "user_email": user.email,
+            "es_document_id": flag_data.es_document_id,
+            "catalog_number": flag_data.catalog_number,
+            "institution_code": flag_data.institution_code,
+            "scientific_name": flag_data.scientific_name,
+            "message": flag_data.message
+        })
+        db.commit()
+        row = result.fetchone()
+        return dict(row._mapping)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to create flag: {str(e)}")
+
+
+@app.get("/flags/record/user", tags=["Record Flags"], summary="Get user's own flags")
+async def get_user_record_flags(
+    status: Optional[str] = None,
+    limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    user: UserInfo = Depends(get_current_user)
+):
+    """Get the current user's record flags (for User Dashboard)."""
+    try:
+        where = "WHERE user_id = :user_id"
+        params = {"user_id": user.user_id, "limit": limit, "offset": offset}
+
+        if status:
+            where += " AND status = :status"
+            params["status"] = status
+
+        count_query = text(f"SELECT COUNT(*) FROM record_flags {where}")
+        total = db.execute(count_query, params).scalar()
+
+        data_query = text(f"""
+            SELECT id, user_id, username, user_email, es_document_id, catalog_number,
+                   institution_code, scientific_name, message, provider_response,
+                   provider_user_id, provider_username, responded_at, status,
+                   created_at, updated_at
+            FROM record_flags {where}
+            ORDER BY created_at DESC
+            LIMIT :limit OFFSET :offset
+        """)
+        rows = db.execute(data_query, params).fetchall()
+        flags = [dict(row._mapping) for row in rows]
+
+        return {"total": total, "flags": flags}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch flags: {str(e)}")
+
+
+@app.get("/flags/record/provider", tags=["Record Flags"], summary="Get flags for a provider")
+async def get_provider_record_flags(
+    institution_code: str = Query(..., description="Institution code"),
+    status: Optional[str] = None,
+    limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    user: UserInfo = Depends(get_current_user)
+):
+    """Get record flags for a specific institution (for Provider Dashboard)."""
+    try:
+        where = "WHERE institution_code = :institution_code"
+        params = {"institution_code": institution_code, "limit": limit, "offset": offset}
+
+        if status:
+            where += " AND status = :status"
+            params["status"] = status
+
+        count_query = text(f"SELECT COUNT(*) FROM record_flags {where}")
+        total = db.execute(count_query, params).scalar()
+
+        data_query = text(f"""
+            SELECT id, user_id, username, user_email, es_document_id, catalog_number,
+                   institution_code, scientific_name, message, provider_response,
+                   provider_user_id, provider_username, responded_at, status,
+                   created_at, updated_at
+            FROM record_flags {where}
+            ORDER BY created_at DESC
+            LIMIT :limit OFFSET :offset
+        """)
+        rows = db.execute(data_query, params).fetchall()
+        flags = [dict(row._mapping) for row in rows]
+
+        return {"total": total, "flags": flags}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch flags: {str(e)}")
+
+
+@app.put("/flags/record/{flag_id}/respond", tags=["Record Flags"], summary="Provider responds to a flag")
+async def respond_to_record_flag(
+    flag_id: int,
+    reply: RecordFlagProviderReply,
+    db: Session = Depends(get_db),
+    user: UserInfo = Depends(get_current_user)
+):
+    """Provider responds to a record flag with a message and status update."""
+    try:
+        # Verify flag exists
+        check_query = text("SELECT id, institution_code FROM record_flags WHERE id = :id")
+        flag = db.execute(check_query, {"id": flag_id}).fetchone()
+
+        if not flag:
+            raise HTTPException(status_code=404, detail="Flag not found")
+
+        update_query = text("""
+            UPDATE record_flags
+            SET provider_response = :response,
+                provider_user_id = :provider_user_id,
+                provider_username = :provider_username,
+                responded_at = CURRENT_TIMESTAMP,
+                status = :new_status
+            WHERE id = :id
+            RETURNING id, user_id, username, user_email, es_document_id, catalog_number,
+                      institution_code, scientific_name, message, provider_response,
+                      provider_user_id, provider_username, responded_at, status,
+                      created_at, updated_at
+        """)
+        result = db.execute(update_query, {
+            "id": flag_id,
+            "response": reply.response,
+            "provider_user_id": user.user_id,
+            "provider_username": user.username,
+            "new_status": reply.new_status
+        })
+        db.commit()
+        row = result.fetchone()
+        return dict(row._mapping)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to respond to flag: {str(e)}")
+
+
+@app.delete("/flags/record/{flag_id}", tags=["Record Flags"], summary="Delete a record flag")
+async def delete_record_flag(
+    flag_id: int,
+    db: Session = Depends(get_db),
+    user: UserInfo = Depends(get_current_user)
+):
+    """User deletes their own open flag."""
+    try:
+        check_query = text("SELECT id, user_id, status FROM record_flags WHERE id = :id")
+        flag = db.execute(check_query, {"id": flag_id}).fetchone()
+
+        if not flag:
+            raise HTTPException(status_code=404, detail="Flag not found")
+
+        flag_dict = dict(flag._mapping)
+        if flag_dict["user_id"] != user.user_id:
+            raise HTTPException(status_code=403, detail="You can only delete your own flags")
+
+        if flag_dict["status"] != "open":
+            raise HTTPException(status_code=400, detail="Can only delete flags with 'open' status")
+
+        delete_query = text("DELETE FROM record_flags WHERE id = :id")
+        db.execute(delete_query, {"id": flag_id})
+        db.commit()
+
+        return {"success": True, "message": "Flag deleted successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete flag: {str(e)}")
+
+
+@app.get("/flags/record/{flag_id}/replies", tags=["Record Flags"], summary="Get replies for a flag")
+async def get_flag_replies(
+    flag_id: int,
+    db: Session = Depends(get_db),
+    user: UserInfo = Depends(get_current_user)
+):
+    """Get all replies in a flag conversation thread."""
+    try:
+        # Verify flag exists and user has access
+        flag_query = text("SELECT id, user_id, institution_code FROM record_flags WHERE id = :id")
+        flag = db.execute(flag_query, {"id": flag_id}).fetchone()
+        if not flag:
+            raise HTTPException(status_code=404, detail="Flag not found")
+
+        replies_query = text("""
+            SELECT id, flag_id, user_id, username, user_role, message, created_at
+            FROM record_flag_replies
+            WHERE flag_id = :flag_id
+            ORDER BY created_at ASC
+        """)
+        rows = db.execute(replies_query, {"flag_id": flag_id}).fetchall()
+        replies = [dict(row._mapping) for row in rows]
+        return {"replies": replies}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch replies: {str(e)}")
+
+
+@app.post("/flags/record/{flag_id}/replies", tags=["Record Flags"], summary="Post a reply to a flag")
+async def create_flag_reply(
+    flag_id: int,
+    reply_data: RecordFlagReplyCreate,
+    db: Session = Depends(get_db),
+    user: UserInfo = Depends(get_current_user)
+):
+    """Both user and provider can post replies to a flag conversation."""
+    try:
+        # Verify flag exists
+        flag_query = text("SELECT id, user_id, institution_code, status FROM record_flags WHERE id = :id")
+        flag = db.execute(flag_query, {"id": flag_id}).fetchone()
+        if not flag:
+            raise HTTPException(status_code=404, detail="Flag not found")
+
+        flag_dict = dict(flag._mapping)
+
+        # Determine role: flag creator = 'user', anyone else = 'provider'
+        user_role = "user" if flag_dict["user_id"] == user.user_id else "provider"
+
+        insert_query = text("""
+            INSERT INTO record_flag_replies (flag_id, user_id, username, user_role, message)
+            VALUES (:flag_id, :user_id, :username, :user_role, :message)
+            RETURNING id, flag_id, user_id, username, user_role, message, created_at
+        """)
+        result = db.execute(insert_query, {
+            "flag_id": flag_id,
+            "user_id": user.user_id,
+            "username": user.username,
+            "user_role": user_role,
+            "message": reply_data.message
+        })
+
+        # Update flag status to in_progress if it was open
+        if flag_dict["status"] == "open":
+            db.execute(
+                text("UPDATE record_flags SET status = 'in_progress' WHERE id = :id"),
+                {"id": flag_id}
+            )
+
+        db.commit()
+        row = result.fetchone()
+        return dict(row._mapping)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to create reply: {str(e)}")
