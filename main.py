@@ -353,9 +353,9 @@ app = FastAPI(
 
 # Initialize SSO authentication
 init_auth(AuthConfig(
-    auth_center_url="http://localhost:8010",
-    project_code="FN2",
-    current_domain="http://localhost:8000"
+    auth_center_url=os.getenv("AUTH_CENTER_URL", "http://localhost:8010"),
+    project_code=os.getenv("AUTH_PROJECT_CODE", "FN2"),
+    current_domain=os.getenv("CURRENT_DOMAIN", "http://localhost:8000")
 ))
 
 origins = [
