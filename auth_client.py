@@ -155,7 +155,7 @@ async def get_current_user(
 
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="需要登录",
+            detail="Login required",
             headers={"Location": login_url}
         )
     return user
