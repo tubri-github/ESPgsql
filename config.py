@@ -30,12 +30,7 @@ class Config(BaseSettings):
     TEMPLATE_DIR: str = os.path.join(STATIC_DIR, "templates")
 
     # cors request
-    CORS_ORIGINS: List[str] = Field(default_factory=lambda: [
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-    ])
+    CORS_ORIGINS: List[str] = Field(default_factory=lambda: ["*"])
     CORS_ALLOW_CREDENTIALS: bool = True
     CORS_ALLOW_METHODS: List[str] = Field(default_factory=lambda: ["*"])
     CORS_ALLOW_HEADERS: List[str] = Field(default_factory=lambda: ["*"])
