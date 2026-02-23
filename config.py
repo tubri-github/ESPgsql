@@ -35,6 +35,11 @@ class Config(BaseSettings):
     CORS_ALLOW_METHODS: List[str] = Field(default_factory=lambda: ["*"])
     CORS_ALLOW_HEADERS: List[str] = Field(default_factory=lambda: ["*"])
 
+    # Session
+    SECRET_KEY: str = os.getenv('SECRET_KEY', 'session')
+    SESSION_COOKIE: str = "session_id"
+    SESSION_MAX_AGE: int = 14 * 24 * 60 * 60
+
     # Database
     DATABASE_URL: str = os.getenv('DATABASE_URL', 'postgresql://postgres:password@localhost:5432/fn2_legacy')
 
@@ -43,7 +48,7 @@ class Config(BaseSettings):
     ES_USER: str = os.getenv('ES_USER', '')
     ES_PASSWORD: str = os.getenv('ES_PASSWORD', '')
     # ES_INDEX: str = os.getenv('ES_INDEX', 'mrservice_full_index')
-    ES_INDEX: str = os.getenv('ES_INDEX', 'mrservice_harvestedfn2_index')
+    ES_INDEX: str = os.getenv('ES_INDEX', 'mrservice_harvestedfn2_fin_index')
 
     # TaxonRank database (for synonym resolution)
     TAXON_DB_URL: str = os.getenv('TAXON_DB_URL', '')
