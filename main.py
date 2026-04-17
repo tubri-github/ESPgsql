@@ -721,36 +721,13 @@ async def aggregation(payload: Optional[SearchPayload] = None):
             if has_wildcard(payload.term):
                 es_query["query"] = build_wildcard_query(payload.term, WILDCARD_SEARCH_FIELDS)
             else:
-                # Smart search: supports synonym (ValidName), fuzzy match, phonetic search
+                # Exact match only for aggregation (no fuzzy/phonetic noise)
                 es_query["query"] = {
-                    "bool": {
-                        "should": [
-                            # Exact match (highest weight) - includes synonym field
-                            {"multi_match": {
-                                "query": payload.term,
-                                "fields": ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
-                                          "InstitutionCode", "CollectionCode", "CatalogNumber",
-                                          "Country", "StateProvince", "County", "Locality"],
-                                "boost": 3
-                            }},
-                            # Fuzzy match (allows spelling errors) - text fields, excluding CatalogNumber
-                            {"multi_match": {
-                                "query": payload.term,
-                                "fields": ["ScientificName", "ValidName", "Genus", "Family",
-                                          "InstitutionCode", "CollectionCode",
-                                          "Country", "StateProvince", "County", "Locality"],
-                                "fuzziness": "AUTO",
-                                "boost": 2
-                            }},
-                            # Phonetic match (similar pronunciation) - species name fields only
-                            {"multi_match": {
-                                "query": payload.term,
-                                "fields": ["ScientificName.phonetic", "ValidName.phonetic",
-                                          "Genus.phonetic", "Family.phonetic"],
-                                "boost": 1
-                            }}
-                        ],
-                        "minimum_should_match": 1
+                    "multi_match": {
+                        "query": payload.term,
+                        "fields": ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
+                                  "InstitutionCode^3", "CollectionCode^3", "CatalogNumber^2",
+                                  "Country", "StateProvince", "County", "Locality^0.5"],
                     }
                 }
         elif payload and payload.conditions:
@@ -1013,11 +990,21 @@ async def adsearch(payload: SearchPayload):
                 if has_wildcard(payload.term):
                     es_query["query"] = build_wildcard_query(payload.term, WILDCARD_SEARCH_FIELDS)
                 else:
-                    # Smart search: supports synonym (ValidName), fuzzy match, phonetic search
+                    # Cascade search: exact → fuzzy → phonetic
+                    # Start with exact match only
                     es_query["query"] = {
-                        "bool": {
+                        "multi_match": {
+                            "query": payload.term,
+                            "fields": ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
+                                      "InstitutionCode^3", "CollectionCode^3", "CatalogNumber^2",
+                                      "Country", "StateProvince", "Locality^0.5"],
+                        }
+                    }
+                    # Define escalation tiers for cascade
+                    _cascade_queries = [
+                        # Tier 2: Exact + Fuzzy
+                        {"bool": {
                             "should": [
-                                # Exact match (highest weight) - includes synonym field
                                 {"multi_match": {
                                     "query": payload.term,
                                     "fields": ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
@@ -1025,16 +1012,35 @@ async def adsearch(payload: SearchPayload):
                                               "Country", "StateProvince", "Locality"],
                                     "boost": 3
                                 }},
-                                # Fuzzy match (allows spelling errors) - text fields, excluding CatalogNumber
                                 {"multi_match": {
                                     "query": payload.term,
                                     "fields": ["ScientificName", "ValidName", "Genus", "Family",
-                                              "InstitutionCode", "CollectionCode",
+                                              "InstitutionCode^3", "CollectionCode^3",
+                                              "Country", "StateProvince", "Locality^0.5"],
+                                    "fuzziness": "AUTO:5,8",
+                                    "boost": 2
+                                }}
+                            ],
+                            "minimum_should_match": 1
+                        }},
+                        # Tier 3: Exact + Fuzzy + Phonetic
+                        {"bool": {
+                            "should": [
+                                {"multi_match": {
+                                    "query": payload.term,
+                                    "fields": ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
+                                              "InstitutionCode", "CollectionCode", "CatalogNumber",
                                               "Country", "StateProvince", "Locality"],
-                                    "fuzziness": "AUTO",
+                                    "boost": 3
+                                }},
+                                {"multi_match": {
+                                    "query": payload.term,
+                                    "fields": ["ScientificName", "ValidName", "Genus", "Family",
+                                              "InstitutionCode^3", "CollectionCode^3",
+                                              "Country", "StateProvince", "Locality^0.5"],
+                                    "fuzziness": "AUTO:5,8",
                                     "boost": 2
                                 }},
-                                # Phonetic match (similar pronunciation) - species name fields only
                                 {"multi_match": {
                                     "query": payload.term,
                                     "fields": ["ScientificName.phonetic", "ValidName.phonetic",
@@ -1043,8 +1049,8 @@ async def adsearch(payload: SearchPayload):
                                 }}
                             ],
                             "minimum_should_match": 1
-                        }
-                    }
+                        }}
+                    ]
             elif isinstance(payload.term, (int, float)):
                 fields = numeric_fields
                 es_query["query"] = {
@@ -1122,6 +1128,28 @@ async def adsearch(payload: SearchPayload):
                 }
             })
 
+        # Cascade search: escalate query if exact results too few
+        if '_cascade_queries' in locals():
+            cascade_threshold = 5
+            # Count with current (exact) query, respecting filters
+            count_q = {"size": 0, "track_total_hits": True}
+            if filter_clauses:
+                count_q["query"] = {"bool": {"must": es_query["query"], "filter": filter_clauses}}
+            else:
+                count_q["query"] = es_query["query"]
+            count = es.search(index=settings.ES_INDEX, body=count_q)["hits"]["total"]["value"]
+
+            if count < cascade_threshold:
+                for next_query in _cascade_queries:
+                    es_query["query"] = next_query
+                    if filter_clauses:
+                        count_q["query"] = {"bool": {"must": next_query, "filter": filter_clauses}}
+                    else:
+                        count_q["query"] = next_query
+                    count = es.search(index=settings.ES_INDEX, body=count_q)["hits"]["total"]["value"]
+                    if count >= cascade_threshold:
+                        break
+
         # Apply all filter clauses
         if filter_clauses:
             # If original query is already a bool query, merge into filter clause
@@ -1136,20 +1164,8 @@ async def adsearch(payload: SearchPayload):
                     }
                 }
 
-        # Sort: push records with empty ScientificName to the bottom
-        es_query["sort"] = [
-            {
-                "_script": {
-                    "type": "number",
-                    "script": {
-                        "source": "doc.containsKey('ScientificName.keyword') && doc['ScientificName.keyword'].size() > 0 && doc['ScientificName.keyword'].value.length() > 0 ? 1 : 0",
-                        "lang": "painless"
-                    },
-                    "order": "desc"
-                }
-            },
-            "_score"
-        ]
+        # Sort by relevance score only
+        es_query["sort"] = ["_score"]
 
         response = es.search(index=settings.ES_INDEX, body=es_query)
         hits = response["hits"]["hits"]
