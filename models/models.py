@@ -276,6 +276,16 @@ class InstitutionFilterParams(PaginationParams):
     sort_by: str = "records_desc"
 
 
+class CountryFilterParams(PaginationParams):
+    # Override per_page upper bound — there are ~250 ISO countries total, so
+    # the choropleth fetches the whole list in a single call (per_page=250+).
+    per_page: int = Field(50, ge=1, le=500)
+    search: Optional[str] = None  # matches countrycode or country_name
+    record_count: Optional[str] = None  # major / medium / small
+    # records_desc | species_desc | name_asc | code_asc
+    sort_by: str = "records_desc"
+
+
 class InstitutionContact(BaseModel):
     """Contact person for an institution."""
     first_name: Optional[str] = None

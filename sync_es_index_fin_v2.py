@@ -221,6 +221,15 @@ def transform_record(record):
             if isinstance(value, str) and value.strip() == "":
                 continue
             doc[es_field] = value
+    # COALESCE: validfamily / validgenus are only filled when the raw
+    # family / genus value is dirty, so prefer them when present. This makes
+    # Family.keyword / Genus.keyword aggregations return clean canonical names.
+    vf = record.get("validfamily")
+    if vf and not (isinstance(vf, str) and vf.strip() == ""):
+        doc["Family"] = vf
+    vg = record.get("validgenus")
+    if vg and not (isinstance(vg, str) and vg.strip() == ""):
+        doc["Genus"] = vg
     return doc
 
 

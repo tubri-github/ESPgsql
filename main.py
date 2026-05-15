@@ -313,7 +313,8 @@ from models.models import (
     HarvestedRecord, FamilyResponse, GenusResponse, SpeciesResponse,
     InstitutionResponse, RecordResponse, TaxonomyStatsResponse,
     InstitutionStatsResponse, PaginatedResponse,
-    TaxonomyFilterParams, InstitutionFilterParams, RecordFilterParams
+    TaxonomyFilterParams, InstitutionFilterParams, RecordFilterParams,
+    CountryFilterParams,
 )
 
 # Simple TTL cache for expensive taxon queries (data only changes during sync)
@@ -392,6 +393,91 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# ============== TaxonRank database (read-only reference) ==============
+# Used to look up the global count of valid fish species (denominator for
+# the home-page species coverage pie chart). The number changes very
+# rarely, so we cache it in-process for an hour.
+
+taxon_engine = create_engine(settings.TAXON_DB_URL) if settings.TAXON_DB_URL else None
+
+_global_species_cache = {"value": None, "expires_at": 0.0}
+_GLOBAL_SPECIES_TTL_SECONDS = 3600
+
+_warned_taxon_unconfigured = False
+
+# Cached set of valid fish family names from TaxonRank (~600 entries, changes
+# very rarely). Used to whitelist-filter the Family aggregation in /adaggregation
+# so the search sidebar doesn't show genus names / typos / concatenated junk.
+_valid_families_cache = {"value": None, "expires_at": 0.0}
+_VALID_FAMILIES_TTL_SECONDS = 3600
+
+def get_valid_fish_families() -> set | None:
+    """Return the set of valid fish family names from TaxonRank, or None
+    when the lookup is unavailable (callers should treat None as
+    "no whitelist available — pass through everything")."""
+    if taxon_engine is None:
+        return None
+    now = time.time()
+    if (
+        _valid_families_cache["value"] is not None
+        and now < _valid_families_cache["expires_at"]
+    ):
+        return _valid_families_cache["value"]
+    try:
+        with taxon_engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT scientific_name FROM taxa "
+                "WHERE rank = 'FAMILY' AND status = 'valid'"
+            )).fetchall()
+        names = {r[0].strip() for r in rows if r[0] and r[0].strip()}
+        _valid_families_cache["value"] = names
+        _valid_families_cache["expires_at"] = now + _VALID_FAMILIES_TTL_SECONDS
+        return names
+    except Exception as e:
+        print(f"Warning: failed to load valid family list from TaxonRank: {e}")
+        return None
+
+
+def get_global_fish_species_count() -> int | None:
+    """Total number of valid fish species in the TaxonRank reference DB.
+
+    Returns None when TAXON_DB_URL is not configured or the query fails —
+    callers should treat None as "denominator unknown" rather than zero.
+    """
+    global _warned_taxon_unconfigured
+    if taxon_engine is None:
+        if not _warned_taxon_unconfigured:
+            print("Warning: TAXON_DB_URL is not set in .env — homepage species "
+                  "coverage pie chart will be hidden. Set it to a "
+                  "postgresql:// URL pointing at the TaxonRank database.")
+            _warned_taxon_unconfigured = True
+        return None
+
+    now = time.time()
+    if _global_species_cache["value"] is not None and now < _global_species_cache["expires_at"]:
+        return _global_species_cache["value"]
+
+    try:
+        with taxon_engine.connect() as conn:
+            # Loose denominator on purpose. Strict `status = 'valid'` (~35,777)
+            # would be closer to Eschmeyer's 37,553 in absolute terms, but the
+            # numerator (totalSpecies from species_stats) is itself loose — it
+            # counts raw (genus, specificepithet) pairs without TaxonRank
+            # validation, so a strict denominator paired with a loose numerator
+            # would systematically understate coverage. See DATA_QUALITY_TODO
+            # for the underlying issues (40% NULL validname + stale
+            # species_stats view).
+            count = conn.execute(text(
+                "SELECT COUNT(*) FROM taxa WHERE rank = 'SPECIES' AND valid_id IS NULL"
+            )).scalar()
+        _global_species_cache["value"] = int(count) if count is not None else None
+        _global_species_cache["expires_at"] = now + _GLOBAL_SPECIES_TTL_SECONDS
+        return _global_species_cache["value"]
+    except Exception as e:
+        print(f"Warning: failed to read global species count from TaxonRank: {e}")
+        return None
 
 
 # Initialize Elasticsearch client
@@ -672,6 +758,10 @@ async def aggregation(payload: Optional[SearchPayload] = None):
     """
     try:
         # Build query
+        # NOTE: Family/Genus values in ES are COALESCE(validfamily/validgenus, family/genus)
+        # — coalescing is done at sync time in sync_es_index_fin_v2.py:transform_record,
+        # so aggregating on Family.keyword directly already yields clean values
+        # (after the index is rebuilt). See docs/PENDING_ES_RESYNC.md.
         es_query = {
             "size": 0,
             "query": {},
@@ -681,8 +771,13 @@ async def aggregation(payload: Optional[SearchPayload] = None):
                         "ScientificName": {
                             "terms": {"field": "ScientificName.keyword", "size": 10, "missing": ""}
                         },
+                        # Pull a buffer of 50 — we filter to TaxonRank's
+                        # valid family names below and then trim back to top 10.
+                        # Without the buffer, junk names (typos, genera in the
+                        # family field, concatenated values like "Cyprinidae;
+                        # Cyprinidae") would crowd out real families.
                         "Family": {
-                            "terms": {"field": "Family.keyword", "size": 10, "missing": ""}
+                            "terms": {"field": "Family.keyword", "size": 50, "missing": ""}
                         }
                     },
                     "filter": {"bool": {"must_not": {"term": {"ScientificName.keyword": ""}}}}
@@ -701,7 +796,7 @@ async def aggregation(payload: Optional[SearchPayload] = None):
                 "Location": {
                     "aggs": {
                         "Country": {
-                            "terms": {"field": "Country.keyword", "size": 10, "missing": ""}
+                            "terms": {"field": "CountryCode.keyword", "size": 10, "missing": ""}
                         },
                         "StateProvince": {
                             "terms": {"field": "StateProvince.keyword", "size": 10, "missing": ""}
@@ -710,7 +805,7 @@ async def aggregation(payload: Optional[SearchPayload] = None):
                             "terms": {"field": "County.keyword", "size": 10, "missing": ""}
                         }
                     },
-                    "filter": {"bool": {"must_not": {"term": {"Country.keyword": ""}}}}
+                    "filter": {"bool": {"must_not": {"term": {"CountryCode.keyword": ""}}}}
                 }
             }
         }
@@ -745,6 +840,11 @@ async def aggregation(payload: Optional[SearchPayload] = None):
         occurrence = aggs.get("Occurrence", {})
         location = aggs.get("Location", {})
 
+        # Whitelist for the Family bucket — pulled from TaxonRank. May be
+        # None if TAXON_DB_URL isn't configured; in that case we pass
+        # everything through (i.e. we don't make things worse).
+        valid_families = get_valid_fish_families()
+
         def parse_buckets(bucket_aggregation, field_name=None):
             buckets = [
                 {"key": bucket["key"], "doc_count": bucket["doc_count"]}
@@ -754,13 +854,18 @@ async def aggregation(payload: Optional[SearchPayload] = None):
             # Apply normalization for fields that need it
             if field_name in ["Country", "StateProvince"]:
                 return merge_normalized_buckets(buckets, field_name)
+            # Whitelist filter for Family — drops typos / genera-in-family /
+            # junk strings that aren't real fish families.
+            if field_name == "Family" and valid_families:
+                buckets = [b for b in buckets if b["key"] in valid_families]
+                buckets = buckets[:10]
             return buckets
 
         return {
             "aggregations": {
                 "Taxon": {
                     "ScientificName": parse_buckets(taxon.get("ScientificName", {})),
-                    "Family": parse_buckets(taxon.get("Family", {})),
+                    "Family": parse_buckets(taxon.get("Family", {}), "Family"),
                     "TotalCount": taxon.get("doc_count", 0)
                 },
                 "Occurrence": {
@@ -770,7 +875,8 @@ async def aggregation(payload: Optional[SearchPayload] = None):
                     "TotalCount": occurrence.get("doc_count", 0)
                 },
                 "Location": {
-                    "Country": parse_buckets(location.get("Country", {}), "Country"),
+                    # Country bucket keys are now ISO 2-letter codes (CountryCode field)
+                    "Country": parse_buckets(location.get("Country", {})),
                     "StateProvince": parse_buckets(location.get("StateProvince", {}), "StateProvince"),
                     "County": parse_buckets(location.get("County", {})),
                     "TotalCount": location.get("doc_count", 0)
@@ -1078,11 +1184,18 @@ async def adsearch(payload: SearchPayload):
         # Execute query with filters (supports legacy single-select, multi-select, and range filters)
         filter_clauses = []
 
+        # Sidebar 'Country' values are ISO 2-letter codes from the CountryCode
+        # aggregation, so route them to the CountryCode field instead of Country.
+        def _filter_field(key: str) -> str:
+            return "CountryCode.keyword" if key == "Country" else f"{key}.keyword"
+
         # Legacy single-select filter conditions
         if filter_conditions:
             for key, value in filter_conditions.items():
-                # For normalized fields, search all variations
-                if key in ["Country", "StateProvince"]:
+                if key == "Country":
+                    filter_clauses.append({"term": {_filter_field(key): value}})
+                elif key == "StateProvince":
+                    # State names still need normalization expansion
                     variations = get_all_variations(value, key)
                     filter_clauses.append({"terms": {f"{key}.keyword": variations}})
                 else:
@@ -1092,8 +1205,9 @@ async def adsearch(payload: SearchPayload):
         multi_filters = payload.multi_filters or {}
         for key, values in multi_filters.items():
             if values and len(values) > 0:
-                # For normalized fields, expand all variations
-                if key in ["Country", "StateProvince"]:
+                if key == "Country":
+                    filter_clauses.append({"terms": {_filter_field(key): values}})
+                elif key == "StateProvince":
                     all_variations = []
                     for v in values:
                         all_variations.extend(get_all_variations(v, key))
@@ -1164,8 +1278,31 @@ async def adsearch(payload: SearchPayload):
                     }
                 }
 
-        # Sort by relevance score only
-        es_query["sort"] = ["_score"]
+        # Sort: push records with missing/empty ScientificName to the bottom,
+        # then by relevance score within each tier. Without this, empty-name
+        # records often beat real ones because they happen to match other
+        # fields on the search term.
+        es_query["sort"] = [
+            {
+                "_script": {
+                    "type": "number",
+                    "order": "asc",
+                    "script": {
+                        "source": (
+                            "if (doc.containsKey('ScientificName.keyword')"
+                            " && doc['ScientificName.keyword'].size() > 0"
+                            " && doc['ScientificName.keyword'].value != null"
+                            " && doc['ScientificName.keyword'].value != '') {"
+                            "  return 0;"
+                            "} else {"
+                            "  return 1;"
+                            "}"
+                        )
+                    },
+                }
+            },
+            "_score",
+        ]
 
         response = es.search(index=settings.ES_INDEX, body=es_query)
         hits = response["hits"]["hits"]
@@ -1222,10 +1359,33 @@ async def adsearch(payload: SearchPayload):
             "countryCount": aggs["unique_countries"]["value"]
         }
 
-        # Get chart data aggregations
+        # Get chart data aggregations.
+        #
+        # Map points: the previous version aggregated by Country.keyword and
+        # plotted each country at the average of its records' coordinates,
+        # which produced misleading single-point clusters of hundreds of
+        # thousands of specimens at country centroids. We now aggregate by
+        # geohash (precision 4 ≈ 39km cells) using a runtime geo_point built
+        # from the existing Latitude/Longitude floats — no re-index needed.
         chart_query = {
             "size": 0,
             "query": es_query["query"],
+            "runtime_mappings": {
+                "Coordinates": {
+                    "type": "geo_point",
+                    "script": {
+                        "source": (
+                            "if (doc['Latitude'].size() > 0 && doc['Longitude'].size() > 0) {"
+                            "  double lat = doc['Latitude'].value;"
+                            "  double lon = doc['Longitude'].value;"
+                            "  if (lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180 && !(lat == 0 && lon == 0)) {"
+                            "    emit(lat, lon);"
+                            "  }"
+                            "}"
+                        )
+                    }
+                }
+            },
             "aggs": {
                 # Timeline: by year
                 "timeline": {
@@ -1242,26 +1402,23 @@ async def adsearch(payload: SearchPayload):
                         "size": 20
                     }
                 },
-                # Map: get georeferenced records with coordinates
+                # Map: distribute records across a geohash grid (real
+                # geographic distribution). Each cell carries its own centroid
+                # plus the most common country name for the tooltip.
                 "map_points": {
-                    "filter": {
-                        "bool": {
-                            "must": [
-                                {"exists": {"field": "Latitude"}},
-                                {"exists": {"field": "Longitude"}}
-                            ]
-                        }
+                    "geohash_grid": {
+                        "field": "Coordinates",
+                        # precision 3 (~156km cells) — coarser than 4 but the
+                        # heatmap blur smooths the difference, and the lower
+                        # cell count avoids hitting the bucket size cap on
+                        # globally distributed taxa (e.g. Cyprinidae).
+                        "precision": 3,
+                        "size": 5000
                     },
                     "aggs": {
-                        "by_country": {
-                            "terms": {
-                                "field": "Country.keyword",
-                                "size": 50
-                            },
-                            "aggs": {
-                                "avg_lat": {"avg": {"field": "Latitude"}},
-                                "avg_lng": {"avg": {"field": "Longitude"}}
-                            }
+                        "centroid": {"geo_centroid": {"field": "Coordinates"}},
+                        "top_country": {
+                            "terms": {"field": "Country.keyword", "size": 1}
                         }
                     }
                 }
@@ -1284,18 +1441,23 @@ async def adsearch(payload: SearchPayload):
             for bucket in chart_aggs["families"]["buckets"]
         ]
 
-        # Process map data (country centroids with counts)
-        map_points = [
-            {
-                "lat": bucket["avg_lat"]["value"],
-                "lng": bucket["avg_lng"]["value"],
+        # Process map data: each bucket = one geohash cell with its centroid.
+        map_points = []
+        for bucket in chart_aggs["map_points"]["buckets"]:
+            centroid = bucket.get("centroid", {}).get("location") or {}
+            lat = centroid.get("lat")
+            lon = centroid.get("lon")
+            if lat is None or lon is None:
+                continue
+            top_country_buckets = bucket.get("top_country", {}).get("buckets", [])
+            country = top_country_buckets[0]["key"] if top_country_buckets else ""
+            map_points.append({
+                "lat": lat,
+                "lng": lon,
                 "count": bucket["doc_count"],
-                "country": bucket["key"],
-                "location": bucket["key"]
-            }
-            for bucket in chart_aggs["map_points"]["by_country"]["buckets"]
-            if bucket["avg_lat"]["value"] and bucket["avg_lng"]["value"]
-        ]
+                "country": country,
+                "location": bucket["key"],  # geohash key, e.g. "9q5"
+            })
 
         # Extract hits data, normalize fields for consistency
         hits_data = [normalize_document({
@@ -2116,6 +2278,10 @@ async def get_institutions_v2(
         db: Session = Depends(get_db)
 ):
     """Get institutions with survey details (v2 test endpoint)"""
+    # NOTE: institution_stats.institution_name is just MAX(institutioncode) — i.e.
+    # the code itself, not a real name. So we require a survey-derived name
+    # (official / alternate / abbreviation) and drop institutions without one;
+    # this also removes the trail of "code-as-name" rows at the end of the list.
     base_select = """
         SELECT
             s.institutioncode, s.institution_name, s.ownerinstitutioncode,
@@ -2129,20 +2295,23 @@ async def get_institutions_v2(
             d.latitude, d.longitude,
             d.sns_twitter, d.sns_facebook, d.sns_instagram,
             d.environment, d.specimens_amount, d.data_url,
-            d.source
+            d.source,
+            COALESCE(d.official_name, d.alternate_name, d.abbreviation_name) AS resolved_name
         FROM dbo.institution_stats s
-        LEFT JOIN dbo.institution_details d ON s.institutioncode = d.institution_code
+        INNER JOIN dbo.institution_details d ON s.institutioncode = d.institution_code
     """
 
-    conditions = []
+    # Only show institutions that have a real name from the survey/xlsx data.
+    conditions = ["COALESCE(d.official_name, d.alternate_name, d.abbreviation_name) IS NOT NULL"]
     params_dict = {}
 
     if params.search:
         conditions.append("""
             (s.institutioncode ILIKE :search
-             OR s.institution_name ILIKE :search
              OR s.country ILIKE :search
              OR d.official_name ILIKE :search
+             OR d.alternate_name ILIKE :search
+             OR d.abbreviation_name ILIKE :search
              OR d.city ILIKE :search)
         """)
         params_dict["search"] = f"%{params.search}%"
@@ -2171,14 +2340,14 @@ async def get_institutions_v2(
         "records_desc": "s.record_count DESC",
         "species_desc": "s.species_count DESC",
         "quality_desc": "s.overall_quality DESC",
-        "name_asc": "COALESCE(d.official_name, s.institution_name) ASC"
+        "name_asc": "COALESCE(d.official_name, d.alternate_name, d.abbreviation_name) ASC"
     }
     order_by = sort_mapping.get(params.sort_by, "s.record_count DESC")
 
     data_query = text(base_select + where_clause + f" ORDER BY {order_by} LIMIT :limit OFFSET :offset")
     count_query = text(f"""
         SELECT COUNT(*) FROM dbo.institution_stats s
-        LEFT JOIN dbo.institution_details d ON s.institutioncode = d.institution_code
+        INNER JOIN dbo.institution_details d ON s.institutioncode = d.institution_code
         {where_clause}
     """)
 
@@ -2195,7 +2364,7 @@ async def get_institutions_v2(
         institutions.append({
             # Stats data
             "institutionCode": row[0],
-            "institutionName": row[16] or row[1],  # Prefer official_name from details
+            "institutionName": row[36],  # COALESCE(official_name, alternate_name, abbreviation_name)
             "ownerInstitutionCode": row[2],
             "statsCountry": row[3],  # Country from stats (specimen locations)
             "region": row[4],
@@ -2523,11 +2692,17 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
         FROM dbo.genus_stats
     """)
 
-    # Query 3: Species/institution counts from cache tables (fast)
+    # Query 3: Species count + institution count aligned with /institutions/v2
+    # (only institutions that have a survey-derived name).
     counts_query = text("""
         SELECT
             (SELECT COUNT(*) FROM dbo.species_stats) as total_species,
-            (SELECT COUNT(*) FROM dbo.institution_stats) as total_institutions
+            (
+                SELECT COUNT(*)
+                FROM dbo.institution_stats s
+                INNER JOIN dbo.institution_details d ON s.institutioncode = d.institution_code
+                WHERE COALESCE(d.official_name, d.alternate_name, d.abbreviation_name) IS NOT NULL
+            ) as total_institutions
     """)
 
     # Query 4: Global metrics from cache table (fast - single row)
@@ -2536,7 +2711,8 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
             total_countries,
             taxonomy_completeness,
             institution_coverage,
-            recently_active_families
+            recently_active_families,
+            total_specimens
         FROM dbo.global_stats
         LIMIT 1
     """)
@@ -2545,6 +2721,7 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
     genus_result = db.execute(genus_stats_query).fetchone()
     counts_result = db.execute(counts_query).fetchone()
     global_result = db.execute(global_stats_query).fetchone()
+    global_fish_species = get_global_fish_species_count()
 
     return {
         # Basic statistics
@@ -2552,8 +2729,12 @@ async def get_taxonomy_stats(db: Session = Depends(get_db)):
         "totalGenera": genus_result[0] or 0,
         "totalSpecies": counts_result[0] or 0,
         "totalRecords": family_result[1] or 0,
+        "totalSpecimens": int(global_result[4]) if global_result[4] is not None else 0,
         "totalInstitutions": counts_result[1] or 0,
         "totalCountries": global_result[0] or 0,
+        # Denominator for the home-page species coverage pie chart. May be
+        # None when TaxonRank is not configured.
+        "globalFishSpecies": global_fish_species,
 
         # Diversity metrics
         "highDiversityFamilies": family_result[4] or 0,
@@ -3278,42 +3459,55 @@ async def get_institution_species(
 async def get_institutions_stats(db: Session = Depends(get_db)):
     """Get institution statistics - fixed version"""
 
-    # 1. Basic statistics - count all institutions
-    basic_stats_query = text("""
+    # Same filter as /institutions/v2: only count institutions that have a real
+    # name from the survey/xlsx data. Keeps the dashboard totals consistent with
+    # the Browse Providers list.
+    surveyed_cte = """
+        WITH surveyed_stats AS (
+            SELECT s.*
+            FROM dbo.institution_stats s
+            INNER JOIN dbo.institution_details d ON s.institutioncode = d.institution_code
+            WHERE COALESCE(d.official_name, d.alternate_name, d.abbreviation_name) IS NOT NULL
+        )
+    """
+
+    # 1. Basic statistics - count surveyed institutions
+    basic_stats_query = text(surveyed_cte + """
         SELECT
             COUNT(*) as total_institutions,
-            (SELECT SUM(array_length(collection_codes, 1)) FROM dbo.institution_stats WHERE collection_codes IS NOT NULL) as total_collection_codes,
+            (SELECT SUM(array_length(collection_codes, 1))
+               FROM surveyed_stats WHERE collection_codes IS NOT NULL) as total_collection_codes,
             SUM(record_count) as total_records,
             (SELECT COUNT(DISTINCT country) FROM dbo.institution_country_distribution) as total_countries,
             ROUND(AVG(georeferencing_quality), 1) as avg_georeferencing,
             ROUND(AVG(date_quality), 1) as avg_date_quality
-        FROM dbo.institution_stats
+        FROM surveyed_stats
     """)
 
     basic_result = db.execute(basic_stats_query).fetchone()
 
     # 2. Contributor classification statistics
-    contributors_query = text("""
-        SELECT 
+    contributors_query = text(surveyed_cte + """
+        SELECT
             COUNT(CASE WHEN record_count > 10000 THEN 1 END) as major_contributors,
             COUNT(CASE WHEN record_count BETWEEN 1000 AND 10000 THEN 1 END) as active_contributors,
             COUNT(CASE WHEN institution_type IN ('museum', 'university') THEN 1 END) as research_collections,
             COUNT(CASE WHEN overall_quality > 90 THEN 1 END) as high_quality_data
-        FROM dbo.institution_stats
+        FROM surveyed_stats
     """)
 
     contributors_result = db.execute(contributors_query).fetchone()
 
     # 3. Geographic distribution statistics - fixed version
-    geographic_distribution_query = text("""
-        SELECT 
+    geographic_distribution_query = text(surveyed_cte + """
+        SELECT
             COUNT(CASE WHEN region = 'North America' THEN 1 END) as north_america,
             COUNT(CASE WHEN region = 'Europe' THEN 1 END) as europe,
             COUNT(CASE WHEN region = 'Asia-Pacific' THEN 1 END) as asia_pacific,
             COUNT(CASE WHEN region = 'South America' THEN 1 END) as south_america,
             COUNT(CASE WHEN region = 'Africa' THEN 1 END) as africa,
             COUNT(CASE WHEN region = 'Other Regions' THEN 1 END) as other_regions
-        FROM dbo.institution_stats
+        FROM surveyed_stats
     """)
 
     geo_result = db.execute(geographic_distribution_query).fetchone()
@@ -3332,13 +3526,13 @@ async def get_institutions_stats(db: Session = Depends(get_db)):
     # collection_result = db.execute(collection_diversity_query).fetchone()
 
     # 5. Temporal coverage analysis - safely handle NULL values
-    temporal_coverage_query = text("""
-        SELECT 
+    temporal_coverage_query = text(surveyed_cte + """
+        SELECT
             COALESCE(SUM(CASE WHEN latest_year >= 2020 THEN record_count ELSE 0 END), 0) as recent_records,
             COALESCE(SUM(CASE WHEN latest_year BETWEEN 2010 AND 2019 THEN record_count ELSE 0 END), 0) as decade_records,
             COALESCE(SUM(CASE WHEN latest_year BETWEEN 2000 AND 2009 THEN record_count ELSE 0 END), 0) as millennium_records,
             COALESCE(SUM(CASE WHEN latest_year < 2000 THEN record_count ELSE 0 END), 0) as historical_records
-        FROM dbo.institution_stats
+        FROM surveyed_stats
         WHERE latest_year IS NOT NULL AND latest_year > 0
     """)
 
@@ -3405,6 +3599,256 @@ async def get_institution_countries(institution_code: str, db: Session = Depends
         })
 
     return {"countries": countries}
+
+
+# ============================================================
+# Countries browse endpoints
+#   /countries           - paginated list (Browse Countries page)
+#   /countries/{code}    - single country detail (CountryDetail page),
+#                          including states + top families + top institutions
+# Backed by dbo.country_stats and dbo.country_state_stats materialized views.
+# ============================================================
+
+@app.get("/countries", response_model=PaginatedResponse, tags=["Countries"])
+async def get_countries(
+    params: CountryFilterParams = Depends(),
+    db: Session = Depends(get_db),
+):
+    """List countries with aggregate stats (paginated)."""
+    base_select = """
+        SELECT
+            countrycode, country_name, record_count, species_count,
+            families_count, genera_count, institutions_count,
+            states_count, georeferencing_quality, date_quality,
+            first_year, latest_year
+        FROM dbo.country_stats
+    """
+
+    conditions = []
+    sql_params = {}
+
+    if params.search:
+        conditions.append("(countrycode ILIKE :search OR country_name ILIKE :search)")
+        sql_params["search"] = f"%{params.search}%"
+
+    if params.record_count == "major":
+        conditions.append("record_count > 100000")
+    elif params.record_count == "medium":
+        conditions.append("record_count BETWEEN 1000 AND 100000")
+    elif params.record_count == "small":
+        conditions.append("record_count < 1000")
+
+    where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    sort_mapping = {
+        "records_desc": "record_count DESC",
+        "species_desc": "species_count DESC",
+        "name_asc": "COALESCE(country_name, countrycode) ASC",
+        "code_asc": "countrycode ASC",
+    }
+    order_by = sort_mapping.get(params.sort_by, "record_count DESC")
+
+    sql_params.update({
+        "limit": params.per_page,
+        "offset": (params.page - 1) * params.per_page,
+    })
+
+    total = db.execute(
+        text(f"SELECT COUNT(*) FROM dbo.country_stats{where_clause}"),
+        {k: v for k, v in sql_params.items() if k not in ("limit", "offset")},
+    ).scalar()
+
+    rows = db.execute(
+        text(f"{base_select}{where_clause} ORDER BY {order_by} LIMIT :limit OFFSET :offset"),
+        sql_params,
+    ).fetchall()
+
+    countries = [
+        {
+            "countryCode": r[0],
+            "countryName": r[1],
+            "recordCount": r[2] or 0,
+            "speciesCount": r[3] or 0,
+            "familiesCount": r[4] or 0,
+            "generaCount": r[5] or 0,
+            "institutionsCount": r[6] or 0,
+            "statesCount": r[7] or 0,
+            "georeferencingQuality": float(r[8]) if r[8] is not None else 0.0,
+            "dateQuality": float(r[9]) if r[9] is not None else 0.0,
+            "firstYear": r[10],
+            "latestYear": r[11],
+        }
+        for r in rows
+    ]
+
+    return PaginatedResponse(
+        data=countries,
+        page=params.page,
+        per_page=params.per_page,
+        total=total or 0,
+        pages=((total or 0) + params.per_page - 1) // params.per_page,
+    )
+
+
+@app.get("/countries/{country_code}", tags=["Countries"])
+async def get_country_detail(country_code: str, db: Session = Depends(get_db)):
+    """Detail for one country: aggregate stats + states + top families + top institutions."""
+    code = country_code.upper().strip()
+    if len(code) != 2:
+        raise HTTPException(status_code=400, detail="country_code must be a 2-letter ISO code")
+
+    main_row = db.execute(
+        text("""
+            SELECT countrycode, country_name, record_count, species_count,
+                   families_count, genera_count, institutions_count,
+                   states_count, georeferencing_quality, date_quality,
+                   first_year, latest_year
+            FROM dbo.country_stats
+            WHERE countrycode = :code
+        """),
+        {"code": code},
+    ).fetchone()
+
+    if not main_row:
+        raise HTTPException(status_code=404, detail=f"Country {code} not found")
+
+    # States within this country (may be empty for small / single-state countries)
+    state_rows = db.execute(
+        text("""
+            SELECT stateprovince, record_count, species_count, institutions_count
+            FROM dbo.country_state_stats
+            WHERE countrycode = :code
+            ORDER BY record_count DESC
+            LIMIT 100
+        """),
+        {"code": code},
+    ).fetchall()
+
+    # Top contributing institutions for this country
+    institution_rows = db.execute(
+        text("""
+            SELECT institutioncode, records_in_country, species_in_country
+            FROM dbo.institution_country_distribution
+            WHERE country = :code
+            ORDER BY records_in_country DESC
+            LIMIT 20
+        """),
+        {"code": code},
+    ).fetchall()
+
+    family_rows = db.execute(
+        text("""
+            SELECT family, record_count, species_count
+            FROM dbo.family_countrycode_stats
+            WHERE countrycode = :code
+            ORDER BY record_count DESC
+            LIMIT 10
+        """),
+        {"code": code},
+    ).fetchall()
+
+    return {
+        "countryCode": main_row[0],
+        "countryName": main_row[1],
+        "recordCount": main_row[2] or 0,
+        "speciesCount": main_row[3] or 0,
+        "familiesCount": main_row[4] or 0,
+        "generaCount": main_row[5] or 0,
+        "institutionsCount": main_row[6] or 0,
+        "statesCount": main_row[7] or 0,
+        "georeferencingQuality": float(main_row[8]) if main_row[8] is not None else 0.0,
+        "dateQuality": float(main_row[9]) if main_row[9] is not None else 0.0,
+        "firstYear": main_row[10],
+        "latestYear": main_row[11],
+        "states": [
+            {
+                "stateProvince": s[0],
+                "recordCount": s[1],
+                "speciesCount": s[2],
+                "institutionsCount": s[3],
+            }
+            for s in state_rows
+        ],
+        "topInstitutions": [
+            {
+                "institutionCode": i[0],
+                "recordCount": i[1],
+                "speciesCount": i[2],
+            }
+            for i in institution_rows
+        ],
+        "topFamilies": [
+            {
+                "family": f[0],
+                "recordCount": f[1],
+                "speciesCount": f[2],
+            }
+            for f in family_rows
+        ],
+    }
+
+
+@app.get("/countries/{country_code}/map-points", tags=["Countries"])
+async def get_country_map_points(
+    country_code: str,
+    south: Optional[float] = Query(None, description="South bound latitude"),
+    north: Optional[float] = Query(None, description="North bound latitude"),
+    west: Optional[float] = Query(None, description="West bound longitude"),
+    east: Optional[float] = Query(None, description="East bound longitude"),
+    zoom: Optional[int] = Query(None, description="Map zoom level (1-18), controls grid precision"),
+    db: Session = Depends(get_db),
+):
+    """Coordinate points for the CountryDetail heatmap.
+    Mirrors the /institutions/{code}/map-points contract: returns a list of
+    [lat, lng, weight] triples plus aggregate counts. Grid precision adapts
+    to the requested zoom level so we don't ship millions of points at world view.
+    """
+    code = country_code.upper().strip()
+    if len(code) != 2:
+        raise HTTPException(status_code=400, detail="country_code must be a 2-letter ISO code")
+
+    if zoom is None or zoom <= 3:
+        precision = 0   # ~111 km grid
+    elif zoom <= 6:
+        precision = 1   # ~11 km grid
+    else:
+        precision = 2   # ~1 km grid
+
+    sql_params = {"code": code}
+    bounds_clause = ""
+    if south is not None and north is not None and west is not None and east is not None:
+        bounds_clause = (
+            " AND decimallatitude  BETWEEN :south AND :north"
+            " AND decimallongitude BETWEEN :west  AND :east"
+        )
+        sql_params.update({"south": south, "north": north, "west": west, "east": east})
+
+    max_points = 50000
+
+    query = text(f"""
+        SELECT ROUND(decimallatitude::numeric,  {precision}) AS lat,
+               ROUND(decimallongitude::numeric, {precision}) AS lng,
+               COUNT(*) AS weight
+        FROM dbo.harvestedfn2_fin
+        WHERE countrycode = :code
+          AND decimallatitude  IS NOT NULL
+          AND decimallongitude IS NOT NULL
+          {bounds_clause}
+        GROUP BY ROUND(decimallatitude::numeric,  {precision}),
+                 ROUND(decimallongitude::numeric, {precision})
+        ORDER BY weight DESC
+        LIMIT {max_points}
+    """)
+
+    rows = db.execute(query, sql_params).fetchall()
+    points = [[float(r[0]), float(r[1]), int(r[2])] for r in rows]
+    total_records = sum(p[2] for p in points)
+
+    return {
+        "points": points,
+        "total": len(points),
+        "totalRecords": total_records,
+    }
 
 
 @app.get("/orders")
