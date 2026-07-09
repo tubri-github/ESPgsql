@@ -24,6 +24,15 @@ from shapely.geometry import box
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan, streaming_bulk
 
+# Backfill must write to the SAME index the live backend serves, which runs with
+# ENV=production (see supervisor.conf). A bare `python backfill_huc4.py` in an
+# interactive shell has no ENV set and would otherwise fall back to `.env` and
+# tag the wrong index. Default to production here so the target always matches
+# the backend. Override for a local/dev run with:  ENV=dev python backfill_huc4.py
+# NOTE: must run BEFORE `from config import settings` — config picks the env file
+# at import time based on ENV.
+os.environ.setdefault("ENV", "production")
+
 from config import settings
 
 # Boundaries ship with the repo (gis/) so this runs anywhere after `git pull`.
