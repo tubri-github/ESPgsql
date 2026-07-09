@@ -134,11 +134,11 @@ def main():
                    _source=["Latitude", "Longitude"],
                    size=BATCH, scroll="10m", preserve_order=False)
 
-    seen = matched = written = 0
+    seen = matched = written = errors_shown = 0
     batch = []
 
     def flush(batch):
-        nonlocal matched, written
+        nonlocal matched, written, errors_shown
         assign = sjoin_batch(batch, huc4_gdf)
         matched += len(assign)
         if args.dry_run or not assign:
@@ -147,9 +147,16 @@ def main():
                     "doc": {"huc4": h, "huc4_name": n}}
                    for _id, (h, n) in assign.items())
         ok = 0
-        for success, _ in streaming_bulk(es, actions, chunk_size=2000,
-                                         raise_on_error=False, request_timeout=180):
-            ok += 1 if success else 0
+        for success, info in streaming_bulk(es, actions, chunk_size=2000,
+                                            raise_on_error=False,
+                                            raise_on_exception=False,
+                                            request_timeout=180):
+            if success:
+                ok += 1
+            elif errors_shown < 5:
+                # surface the actual ES rejection instead of silently counting 0
+                print("  BULK ERROR:", info)
+                errors_shown += 1
         written += ok
 
     for hit in scanner:
