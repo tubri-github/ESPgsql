@@ -105,6 +105,11 @@ def main():
 
     es = get_es()
     idx = settings.ES_INDEX
+    # Show WHICH es/index we're about to write to — the operator must eyeball this
+    # before a full run, since `.env` vs `.env.production` (ENV var) picks the target.
+    env = os.getenv("ENV") or "(default -> .env)"
+    print(f"ENV={env}")
+    print(f"ES_URL={settings.ES_URL}")
     print("index:", idx, "| dry-run:", args.dry_run, "| max-docs:", args.max_docs or "ALL")
 
     huc4_gdf = load_huc4()
