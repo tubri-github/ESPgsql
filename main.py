@@ -157,6 +157,36 @@ def calculate_bounding_box(geo_filter) -> dict:
         }
 
 
+def build_geo_drainage_clauses(geo_filter, drainages, combine="and") -> list:
+    """Combine a drawn-shape geo_filter (as its bounding box) and a river-drainage
+    selection (huc4_name) into ES filter clauses.
+
+    combine='or'  -> a record matches if it is inside the shape OR in a drainage.
+    combine='and' -> both must hold (the shape ∩ the drainages).
+    Either input may be absent; returns [] when both are.
+    """
+    geo_clause = None
+    if geo_filter and getattr(geo_filter, "coordinates", None):
+        bbox = calculate_bounding_box(geo_filter)
+        geo_clause = {"bool": {"must": [
+            {"exists": {"field": "Latitude"}},
+            {"exists": {"field": "Longitude"}},
+            {"range": {"Latitude": {"gte": bbox["min_lat"], "lte": bbox["max_lat"]}}},
+            {"range": {"Longitude": {"gte": bbox["min_lon"], "lte": bbox["max_lon"]}}},
+        ]}}
+    drainage_clause = {"terms": {"huc4_name.keyword": drainages}} if drainages else None
+
+    if geo_clause and drainage_clause:
+        if (combine or "and").lower() == "or":
+            return [{"bool": {"should": [geo_clause, drainage_clause], "minimum_should_match": 1}}]
+        return [geo_clause, drainage_clause]
+    if geo_clause:
+        return [geo_clause]
+    if drainage_clause:
+        return [drainage_clause]
+    return []
+
+
 def filter_by_geo(hits: list, geo_filter) -> list:
     """
     Perform precise geo filtering on search results.
@@ -527,9 +557,13 @@ class SearchPayload(BaseModel):
     filter_conditions: Optional[Dict[str, str]] = None  # Legacy: single-select filter
     multi_filters: Optional[Dict[str, List[str]]] = None  # Multi-select filter conditions
     range_filters: Optional[Dict[str, Dict[str, float]]] = None  # Range filters {"YearCollected": {"min": 1900, "max": 2024}}
-    geo_filter: Optional[GeoFilter] = None  # Geo filter conditions
+    geo_filter: Optional[GeoFilter] = None  # Drawn-shape geo filter (polygon/rectangle/circle)
+    drainages: Optional[List[str]] = None  # Selected river drainages (huc4_name), from the Location Filter
+    geo_combine: Optional[str] = "and"  # How geo_filter and drainages combine: 'and' (∩) or 'or' (∪)
     page: int = 0
     page_size: int = 10
+    sort_field: Optional[str] = None   # Column to sort by (server-side); None = default relevance sort
+    sort_order: Optional[str] = None   # 'asc' or 'desc'
 
 def apply_sort(query, sort_by: str, model_class):
     """Apply sorting"""
@@ -597,6 +631,12 @@ def get_field_types(es, index_name):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch field types: {str(e)}")
 
+
+
+def is_quoted_phrase(term: str) -> bool:
+    """A term wrapped in double quotes means: match it as an exact phrase."""
+    t = term.strip()
+    return len(t) >= 2 and t.startswith('"') and t.endswith('"')
 
 
 def build_field_query(field: str, operator: Optional[str], value: str) -> dict:
@@ -803,6 +843,12 @@ async def aggregation(payload: Optional[SearchPayload] = None):
                         },
                         "County": {
                             "terms": {"field": "County.keyword", "size": 10, "missing": ""}
+                        },
+                        # US river drainage (HUC4 subregion), tagged by backfill_huc4.py.
+                        # Only US records carry huc4_name; empty bucket is filtered out.
+                        # size 15 so a multi-region search still surfaces its drainages.
+                        "Drainage": {
+                            "terms": {"field": "huc4_name.keyword", "size": 15, "missing": ""}
                         }
                     },
                     "filter": {"bool": {"must_not": {"term": {"CountryCode.keyword": ""}}}}
@@ -829,6 +875,40 @@ async def aggregation(payload: Optional[SearchPayload] = None):
             es_query["query"] = build_es_query(payload.conditions)["query"]
         else:
             es_query["query"] = {"match_all": {}}
+
+        # Constrain the facet buckets by the first-level filters the caller sends
+        # (multi_filters + geo_filter). Without this the facets ignore the current
+        # filters — e.g. after filtering to the Pearl drainage, the Drainage facet
+        # would still list every drainage. Mirrors the /adsearch filter handling.
+        if payload:
+            filter_clauses = []
+            for key, values in (payload.multi_filters or {}).items():
+                if not values:
+                    continue
+                if key == "Country":
+                    filter_clauses.append({"terms": {"CountryCode.keyword": values}})
+                elif key == "StateProvince":
+                    all_variations = []
+                    for v in values:
+                        all_variations.extend(get_all_variations(v, key))
+                    filter_clauses.append({"terms": {f"{key}.keyword": list(set(all_variations))}})
+                else:
+                    filter_clauses.append({"terms": {f"{key}.keyword": values}})
+
+            for key, range_values in (payload.range_filters or {}).items():
+                range_query = {}
+                if range_values.get("min") is not None:
+                    range_query["gte"] = range_values["min"]
+                if range_values.get("max") is not None:
+                    range_query["lte"] = range_values["max"]
+                if range_query:
+                    filter_clauses.append({"range": {key: range_query}})
+
+            filter_clauses.extend(build_geo_drainage_clauses(
+                payload.geo_filter, payload.drainages, payload.geo_combine))
+
+            if filter_clauses:
+                es_query["query"] = {"bool": {"must": es_query["query"], "filter": filter_clauses}}
 
         # Execute query
         # response = es.search(index=settings.ES_INDEX, body=es_query)
@@ -879,6 +959,9 @@ async def aggregation(payload: Optional[SearchPayload] = None):
                     "Country": parse_buckets(location.get("Country", {})),
                     "StateProvince": parse_buckets(location.get("StateProvince", {}), "StateProvince"),
                     "County": parse_buckets(location.get("County", {})),
+                    # US river drainage (HUC4) facet — bucket key is the drainage name,
+                    # which is also the multi_filters value the frontend sends back.
+                    "Drainage": parse_buckets(location.get("Drainage", {})),
                     "TotalCount": location.get("doc_count", 0)
                 }
             }
@@ -1095,6 +1178,19 @@ async def adsearch(payload: SearchPayload):
                 # Check if wildcard search
                 if has_wildcard(payload.term):
                     es_query["query"] = build_wildcard_query(payload.term, WILDCARD_SEARCH_FIELDS)
+                elif is_quoted_phrase(payload.term):
+                    # Quoted input -> exact phrase. No fuzzy/phonetic cascade, so
+                    # "Etheostoma spectabile" matches that species, not all Etheostoma.
+                    phrase = payload.term.strip().strip('"')
+                    es_query["query"] = {
+                        "multi_match": {
+                            "query": phrase,
+                            "type": "phrase",
+                            "fields": ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
+                                      "InstitutionCode^3", "CollectionCode^3", "CatalogNumber^2",
+                                      "Country", "StateProvince", "Locality^0.5"],
+                        }
+                    }
                 else:
                     # Cascade search: exact → fuzzy → phonetic
                     # Start with exact match only
@@ -1226,21 +1322,10 @@ async def adsearch(payload: SearchPayload):
             if range_query:
                 filter_clauses.append({"range": {key: range_query}})
 
-        # Geo filter conditions - use bounding box for fast initial filtering
-        geo_filter = payload.geo_filter
-        if geo_filter and geo_filter.coordinates:
-            bbox = calculate_bounding_box(geo_filter)
-            # Add bounding box range query (fast filtering)
-            filter_clauses.append({
-                "bool": {
-                    "must": [
-                        {"exists": {"field": "Latitude"}},
-                        {"exists": {"field": "Longitude"}},
-                        {"range": {"Latitude": {"gte": bbox["min_lat"], "lte": bbox["max_lat"]}}},
-                        {"range": {"Longitude": {"gte": bbox["min_lon"], "lte": bbox["max_lon"]}}}
-                    ]
-                }
-            })
+        # Location Filter: drawn shape and/or river-drainage selection, combined
+        # per payload.geo_combine ('and' = ∩, 'or' = ∪). Bounding box for the shape.
+        filter_clauses.extend(build_geo_drainage_clauses(
+            payload.geo_filter, payload.drainages, payload.geo_combine))
 
         # Cascade search: escalate query if exact results too few
         if '_cascade_queries' in locals():
@@ -1278,31 +1363,44 @@ async def adsearch(payload: SearchPayload):
                     }
                 }
 
-        # Sort: push records with missing/empty ScientificName to the bottom,
-        # then by relevance score within each tier. Without this, empty-name
-        # records often beat real ones because they happen to match other
-        # fields on the search term.
-        es_query["sort"] = [
-            {
-                "_script": {
-                    "type": "number",
-                    "order": "asc",
-                    "script": {
-                        "source": (
-                            "if (doc.containsKey('ScientificName.keyword')"
-                            " && doc['ScientificName.keyword'].size() > 0"
-                            " && doc['ScientificName.keyword'].value != null"
-                            " && doc['ScientificName.keyword'].value != '') {"
-                            "  return 0;"
-                            "} else {"
-                            "  return 1;"
-                            "}"
-                        )
-                    },
-                }
-            },
-            "_score",
-        ]
+        # Sort. When the user explicitly sorts a column, do it server-side so it
+        # covers the whole result set (not just the current page — issue #2).
+        # Otherwise fall back to: push records with missing/empty ScientificName
+        # to the bottom, then by relevance. Without that fallback, empty-name
+        # records often beat real ones because they match other fields on the term.
+        if payload.sort_field:
+            order = "desc" if (payload.sort_order or "").lower() == "desc" else "asc"
+            ftype = field_types.get(payload.sort_field)
+            # text fields need the .keyword subfield to sort; keyword/numeric/date sort directly
+            es_sort_field = f"{payload.sort_field}.keyword" if ftype == "text" else payload.sort_field
+            # unmapped_type lets ES no-op (instead of 400) if the chosen column has
+            # no sortable subfield — every column is sortable from the UI (#17),
+            # but not all have a .keyword in the mapping.
+            es_query["sort"] = [
+                {es_sort_field: {"order": order, "missing": "_last", "unmapped_type": "keyword"}},
+            ]
+        else:
+            es_query["sort"] = [
+                {
+                    "_script": {
+                        "type": "number",
+                        "order": "asc",
+                        "script": {
+                            "source": (
+                                "if (doc.containsKey('ScientificName.keyword')"
+                                " && doc['ScientificName.keyword'].size() > 0"
+                                " && doc['ScientificName.keyword'].value != null"
+                                " && doc['ScientificName.keyword'].value != '') {"
+                                "  return 0;"
+                                "} else {"
+                                "  return 1;"
+                                "}"
+                            )
+                        },
+                    }
+                },
+                "_score",
+            ]
 
         response = es.search(index=settings.ES_INDEX, body=es_query)
         hits = response["hits"]["hits"]
@@ -1466,8 +1564,11 @@ async def adsearch(payload: SearchPayload):
             **hit["_source"]
         }) for hit in hits]
 
-        # If geo_filter exists, perform precise polygon/circle filtering
-        if geo_filter and geo_filter.coordinates:
+        # Precise polygon/circle refinement of the current page — only when the
+        # shape is an intersection constraint. For combine='or' the page also
+        # contains drainage matches outside the shape, so skip it.
+        geo_filter = payload.geo_filter
+        if geo_filter and geo_filter.coordinates and (payload.geo_combine or "and").lower() != "or":
             hits_data = filter_by_geo(hits_data, geo_filter)
 
         return {
@@ -1481,6 +1582,117 @@ async def adsearch(payload: SearchPayload):
             },
             "geo_filtered": geo_filter is not None  # Flag whether geo filtering was applied
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class MapPointsPayload(SearchPayload):
+    # Map viewport bounding box: {min_lat, max_lat, min_lon, max_lon}
+    bbox: Optional[Dict[str, float]] = None
+    limit: int = 2000  # cap individual points returned for one viewport
+
+
+@app.post("/map_points", tags=["Search"], summary="Individual map points in a viewport")
+async def map_points(payload: MapPointsPayload):
+    """
+    Real individual records (not geohash cells) within the current map viewport,
+    for the zoomed-in single-point view (issue #19). Same search terms/filters as
+    /adsearch, restricted to a bbox and capped at `limit` points; `capped` tells
+    the UI to ask the user to zoom in further.
+    """
+    try:
+        # Base query — same shape as /adsearch, minus the fuzzy/phonetic cascade
+        # (the map should plot exactly what matches, not a widened fallback set).
+        term_fields = ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
+                       "InstitutionCode^3", "CollectionCode^3", "CatalogNumber^2",
+                       "Country", "StateProvince", "Locality^0.5"]
+        if payload.conditions:
+            base_query = build_es_query(payload.conditions)["query"]
+        elif payload.term:
+            if has_wildcard(payload.term):
+                base_query = build_wildcard_query(payload.term, WILDCARD_SEARCH_FIELDS)
+            elif is_quoted_phrase(payload.term):
+                phrase = payload.term.strip().strip('"')
+                base_query = {"multi_match": {"query": phrase, "type": "phrase", "fields": term_fields}}
+            else:
+                base_query = {"multi_match": {"query": payload.term, "fields": term_fields}}
+        else:
+            base_query = {"match_all": {}}
+
+        # Filters — mirror /adsearch (Country routes to CountryCode; StateProvince expands)
+        filter_clauses = []
+
+        def _filter_field(key: str) -> str:
+            return "CountryCode.keyword" if key == "Country" else f"{key}.keyword"
+
+        for key, value in (payload.filter_conditions or {}).items():
+            if key == "StateProvince":
+                filter_clauses.append({"terms": {f"{key}.keyword": get_all_variations(value, key)}})
+            else:
+                filter_clauses.append({"term": {_filter_field(key): value}})
+
+        for key, values in (payload.multi_filters or {}).items():
+            if values:
+                if key == "StateProvince":
+                    variations = []
+                    for v in values:
+                        variations.extend(get_all_variations(v, key))
+                    filter_clauses.append({"terms": {f"{key}.keyword": list(set(variations))}})
+                else:
+                    filter_clauses.append({"terms": {_filter_field(key): values}})
+
+        for key, rv in (payload.range_filters or {}).items():
+            rq = {}
+            if rv.get("min") is not None:
+                rq["gte"] = rv["min"]
+            if rv.get("max") is not None:
+                rq["lte"] = rv["max"]
+            if rq:
+                filter_clauses.append({"range": {key: rq}})
+
+        # Location Filter (drawn shape and/or drainages, combined per geo_combine)
+        # so the map points match the table.
+        filter_clauses.extend(build_geo_drainage_clauses(
+            payload.geo_filter, payload.drainages, payload.geo_combine))
+
+        # Require coordinates, and restrict to the viewport bbox if provided
+        filter_clauses.append({"exists": {"field": "Latitude"}})
+        filter_clauses.append({"exists": {"field": "Longitude"}})
+        bbox = payload.bbox or {}
+        if all(k in bbox for k in ("min_lat", "max_lat", "min_lon", "max_lon")):
+            filter_clauses.append({"range": {"Latitude": {"gte": bbox["min_lat"], "lte": bbox["max_lat"]}}})
+            filter_clauses.append({"range": {"Longitude": {"gte": bbox["min_lon"], "lte": bbox["max_lon"]}}})
+
+        body = {
+            "size": max(1, min(payload.limit, 5000)),
+            "query": {"bool": {"must": base_query, "filter": filter_clauses}},
+            "track_total_hits": True,
+            "_source": ["Latitude", "Longitude", "ScientificName", "ValidName",
+                        "CatalogNumber", "InstitutionCode", "CollectionCode", "Country"],
+        }
+
+        resp = es.search(index=settings.ES_INDEX, body=body)
+        total = resp["hits"]["total"]["value"]
+
+        points = []
+        for hit in resp["hits"]["hits"]:
+            s = hit["_source"]
+            lat = s.get("Latitude")
+            lon = s.get("Longitude")
+            if lat is None or lon is None:
+                continue
+            points.append({
+                "id": hit["_id"],
+                "lat": lat,
+                "lng": lon,
+                "scientificName": s.get("ScientificName") or s.get("ValidName") or "",
+                "catalogNumber": s.get("CatalogNumber"),
+                "institutionCode": s.get("InstitutionCode"),
+                "collectionCode": s.get("CollectionCode"),
+                "country": s.get("Country"),
+            })
+
+        return {"points": points, "total": total, "capped": total > len(points)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
