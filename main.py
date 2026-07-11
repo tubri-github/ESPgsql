@@ -322,27 +322,31 @@ from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, func, text, desc, asc
 from typing import List, Optional, Dict
 
-# Normalization mappings for common field variations
+# Country name/alias -> ISO 3166-1 alpha-2 code. The ES `CountryCode` field
+# stores ISO-2 codes ("US", "CA", ...), NOT full names, so these MUST resolve to
+# codes — otherwise a search/filter for "usa"/"united states" matches nothing.
 COUNTRY_NORMALIZATION = {
     # USA variations
-    "u.s.a": "USA", "u.s.a.": "USA", "united states": "USA",
-    "united states of america": "USA", "us": "USA", "u.s.": "USA",
-    "america": "USA", "estados unidos": "USA", "usa": "USA",
+    "u.s.a": "US", "u.s.a.": "US", "united states": "US",
+    "united states of america": "US", "us": "US", "u.s.": "US",
+    "america": "US", "estados unidos": "US", "usa": "US",
     # Canada variations
-    "can": "Canada", "can.": "Canada", "ca": "Canada", "canada": "Canada",
+    "can": "CA", "can.": "CA", "canada": "CA",
     # Mexico variations
-    "mex": "Mexico", "mex.": "Mexico", "mexique": "Mexico",
-    "mx": "Mexico", "estados unidos mexicanos": "Mexico", "mexico": "Mexico",
+    "mex": "MX", "mex.": "MX", "mexique": "MX",
+    "mx": "MX", "estados unidos mexicanos": "MX", "mexico": "MX",
     # UK variations
-    "u.k.": "UK", "u.k": "UK", "united kingdom": "UK",
-    "great britain": "UK", "britain": "UK", "england": "UK",
+    "u.k.": "GB", "u.k": "GB", "uk": "GB", "united kingdom": "GB",
+    "great britain": "GB", "britain": "GB", "england": "GB",
     # Other common variations
-    "p.r. china": "China", "p.r.china": "China", "peoples republic of china": "China",
-    "russian federation": "Russia", "brasil": "Brazil",
-    "republic of south africa": "South Africa", "rsa": "South Africa",
-    "federal republic of germany": "Germany", "west germany": "Germany",
-    "republic of korea": "South Korea", "korea, republic of": "South Korea",
-    "democratic peoples republic of korea": "North Korea",
+    "p.r. china": "CN", "p.r.china": "CN", "peoples republic of china": "CN", "china": "CN",
+    "russian federation": "RU", "russia": "RU",
+    "brasil": "BR", "brazil": "BR",
+    "republic of south africa": "ZA", "rsa": "ZA", "south africa": "ZA",
+    "federal republic of germany": "DE", "west germany": "DE", "germany": "DE",
+    "republic of korea": "KR", "korea, republic of": "KR", "south korea": "KR",
+    "democratic peoples republic of korea": "KP", "north korea": "KP",
+    "australia": "AU", "japan": "JP", "venezuela": "VE", "philippines": "PH",
 }
 
 STATE_NORMALIZATION = {
@@ -371,6 +375,16 @@ def normalize_value(value: str, field_name: str) -> str:
         return STATE_NORMALIZATION.get(value_lower, value)
 
     return value
+
+
+def resolve_country_code(term) -> Optional[str]:
+    """If the whole search term is a country name/alias (e.g. 'usa',
+    'united states', 'brazil'), return its ISO-2 code so a simple search finds
+    records by the CountryCode field. Returns None for anything that isn't a
+    recognised country term (so taxon/institution searches are unaffected)."""
+    if not term or not isinstance(term, str):
+        return None
+    return COUNTRY_NORMALIZATION.get(term.lower().strip())
 
 def merge_normalized_buckets(buckets: list, field_name: str) -> list:
     """Merge buckets that normalize to the same value"""
@@ -1358,8 +1372,15 @@ async def adsearch(payload: SearchPayload):
         if payload.term:
             # Determine term type and select fields accordingly
             if isinstance(payload.term, str):
+                _country_code = resolve_country_code(payload.term)
+                # Whole term is a country name/alias -> match the ISO CountryCode
+                # field directly, so "usa"/"united states"/"brazil" find those
+                # records (the field stores ISO-2 codes, not full names). Precise
+                # match, so no fuzzy/phonetic cascade.
+                if _country_code:
+                    es_query["query"] = {"term": {"CountryCode.keyword": _country_code}}
                 # Check if wildcard search
-                if has_wildcard(payload.term):
+                elif has_wildcard(payload.term):
                     es_query["query"] = build_wildcard_query(payload.term, WILDCARD_SEARCH_FIELDS)
                 elif is_quoted_phrase(payload.term):
                     # Quoted input -> exact phrase. No fuzzy/phonetic cascade, so
@@ -1545,15 +1566,27 @@ async def adsearch(payload: SearchPayload):
                         "type": "number",
                         "order": "asc",
                         "script": {
+                            # 3-tier default ordering:
+                            #  0 = species/genus-level (has a ScientificName AND a Genus)
+                            #  1 = family-level only (has a name but no Genus) -> demoted
+                            #      so bare "Cyprinidae" rows don't dominate the top
+                            #  2 = no ScientificName at all -> bottom
                             "source": (
-                                "if (doc.containsKey('ScientificName.keyword')"
+                                "boolean hasName = doc.containsKey('ScientificName.keyword')"
                                 " && doc['ScientificName.keyword'].size() > 0"
                                 " && doc['ScientificName.keyword'].value != null"
-                                " && doc['ScientificName.keyword'].value != '') {"
-                                "  return 0;"
-                                "} else {"
-                                "  return 1;"
-                                "}"
+                                " && doc['ScientificName.keyword'].value != '';"
+                                "if (!hasName) { return 2; }"
+                                # A ValidName means the ETL resolved this to an accepted
+                                # species. Rows without one are family-level / unresolved
+                                # ("Cyprinidae", "Cyprinidae sp.", "...indet. gen.") — demote
+                                # them so bare family rows don't dominate a family search.
+                                "boolean hasValid = doc.containsKey('ValidName.keyword')"
+                                " && doc['ValidName.keyword'].size() > 0"
+                                " && doc['ValidName.keyword'].value != null"
+                                " && doc['ValidName.keyword'].value != '';"
+                                "if (!hasValid) { return 1; }"
+                                "return 0;"
                             )
                         },
                     }
