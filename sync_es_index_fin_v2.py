@@ -45,7 +45,11 @@ INDEX_NAME = "mrservice_harvestedfn2_fin_v2_test"
 # Field mapping
 FIELD_MAPPING = {
     "catalognumber": "CatalogNumber",
-    "species": "ScientificName",
+    # ScientificName must come from the ETL-built `scientificname` column (99.1% filled,
+    # reconstructed from genus+specificEpithet when blank), NOT the raw DwC `species`
+    # column (only 16.4% filled). Mapping it to `species` left ES ScientificName 84%
+    # empty and made reviewer bug #1 look unfixed even though PG was correct.
+    "scientificname": "ScientificName",
     "validname": "ValidName",
     "validgenus": "ValidGenus",
     "validfamily": "ValidFamily",
@@ -97,6 +101,15 @@ FIELD_MAPPING = {
     "habitat": "Habitat",
     "associatedmedia": "AssociatedMedia",
     "datasetname": "DatasetName",
+    # Type status (holotype/paratype/…) — reviewer asked for it to be viewable +
+    # searchable. Requires the typestatus column in dbo.harvestedfn2_fin (ALTER).
+    "typestatus": "TypeStatus",
+    # HUC4 river-drainage tag — now produced by the ETL (etl_processor_v3.py
+    # lookup_huc4) and stored in the base table, so it rides through here instead
+    # of the old ES-only backfill_huc4.py. Requires the huc4 / huc4_name columns
+    # to exist in dbo.harvestedfn2_fin (ALTER TABLE ADD COLUMN before syncing).
+    "huc4": "huc4",
+    "huc4_name": "huc4_name",
 }
 
 
@@ -168,13 +181,17 @@ INDEX_MAPPING = {
             "PreparationType": text_keyword_field(),
             "Remarks": text_keyword_field(),
             "GeorefMethod": text_keyword_field(),
-            "CoordinateUncertaintyInMeters": text_keyword_field(),
+            # Numeric (meters). The ETL (clean_coordinate_uncertainty) now writes a
+            # clean number or null, so this can be a real numeric field and range
+            # queries (> < >= <=) work. ignore_malformed keeps any stray non-numeric
+            # value (e.g. from records not yet re-run) from rejecting the whole doc.
+            "CoordinateUncertaintyInMeters": {"type": "float", "ignore_malformed": True},
             "Latitude": {"type": "float"},
             "Longitude": {"type": "float"},
             "YearCollected": {"type": "long"},
             "MonthCollected": {"type": "long"},
             "DayCollected": {"type": "long"},
-            "IndividualCount": {"type": "long"},
+            "IndividualCount": {"type": "long", "ignore_malformed": True},
             "DateLastModified": {"type": "date", "ignore_malformed": True},
             "SpecificEpithet": text_keyword_field(),
             "ScientificNameAuthorship": text_keyword_field(),
@@ -198,6 +215,11 @@ INDEX_MAPPING = {
             "Habitat": text_keyword_field(),
             "AssociatedMedia": text_keyword_field(),
             "DatasetName": text_keyword_field(),
+            "TypeStatus": text_keyword_field(),
+            # HUC4 drainage tag (text+keyword, same shape as CountryCode) so
+            # huc4_name.keyword exists for the Drainage facet / filter.
+            "huc4": text_keyword_field(),
+            "huc4_name": text_keyword_field(),
         }
     }
 }

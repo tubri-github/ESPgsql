@@ -61,6 +61,32 @@ STANDARD_DOCUMENT_FIELDS = [
     "BasisOfRecord", "RecordedBy", "Remarks"
 ]
 
+# Fields mapped as numeric (long/float) in the ES index — they have NO `.keyword`
+# sub-field, so `=`/`!=` must term-query the field itself, not `{field}.keyword`.
+NUMERIC_FIELDS = {
+    "IndividualCount", "Latitude", "Longitude",
+    "YearCollected", "MonthCollected", "DayCollected",
+}
+
+# Shared field list for simple-search `term` queries. /adsearch (results),
+# /adaggregation (facets) and /map_points MUST match on the SAME fields, or the
+# facet counts disagree with the result counts. (They had drifted: only the
+# aggregation list included "County", so its totals ran higher than the results.)
+TERM_QUERY_FIELDS = ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
+                     "InstitutionCode^3", "CollectionCode^3", "CatalogNumber^2",
+                     "Country", "StateProvince", "Locality^0.5"]
+
+# Facet response for "no active search" (no term, no conditions, no filter). Same
+# shape as the normal /adaggregation return but with empty buckets and zero totals,
+# so the sidebar shows nothing rather than the whole-index counts.
+EMPTY_AGGREGATION_RESPONSE = {
+    "aggregations": {
+        "Taxon": {"ScientificName": [], "Family": [], "TotalCount": 0},
+        "Occurrence": {"InstitutionCode": [], "CollectionCode": [], "IndividualCount": [], "TotalCount": 0},
+        "Location": {"Country": [], "StateProvince": [], "County": [], "Drainage": [], "TotalCount": 0},
+    }
+}
+
 
 def normalize_document(doc: dict, fields: list = None) -> dict:
     """
@@ -185,6 +211,69 @@ def build_geo_drainage_clauses(geo_filter, drainages, combine="and") -> list:
     if drainage_clause:
         return [drainage_clause]
     return []
+
+
+def build_filter_clauses(payload) -> list:
+    """Single source of truth for turning a search payload's sidebar/facet filters
+    into ES `filter` clauses. Used identically by /adsearch (table rows),
+    /adaggregation (facet counts) and /map_points (map markers) so the three always
+    describe the exact same filtered set — this is what prevents the "table shows 3,
+    facet shows 万" divergence: a filter applied to the table but not the facets.
+
+    Handles every filter dimension:
+      - filter_conditions : legacy single-select (one value per field)
+      - multi_filters     : multi-select (list of values per field)
+      - range_filters     : numeric {min,max} ranges
+      - geo_filter/drainages : drawn-shape ∩/∪ river-drainage location filter
+
+    'Country' values are ISO codes from the CountryCode facet, so they route to
+    CountryCode.keyword; 'StateProvince' values are expanded through
+    get_all_variations to cover spelling/abbreviation variants.
+    """
+    clauses = []
+
+    def _field(key: str) -> str:
+        return "CountryCode.keyword" if key == "Country" else f"{key}.keyword"
+
+    # Legacy single-select filter conditions
+    for key, value in (getattr(payload, "filter_conditions", None) or {}).items():
+        if value is None or value == "":
+            continue
+        if key == "StateProvince":
+            clauses.append({"terms": {f"{key}.keyword": get_all_variations(value, key)}})
+        else:
+            clauses.append({"term": {_field(key): value}})
+
+    # Multi-select filter conditions
+    for key, values in (getattr(payload, "multi_filters", None) or {}).items():
+        if not values:
+            continue
+        if key == "StateProvince":
+            variations = []
+            for v in values:
+                variations.extend(get_all_variations(v, key))
+            clauses.append({"terms": {f"{key}.keyword": list(set(variations))}})
+        else:
+            clauses.append({"terms": {_field(key): values}})
+
+    # Numeric range filter conditions
+    for key, rv in (getattr(payload, "range_filters", None) or {}).items():
+        rq = {}
+        if rv.get("min") is not None:
+            rq["gte"] = rv["min"]
+        if rv.get("max") is not None:
+            rq["lte"] = rv["max"]
+        if rq:
+            clauses.append({"range": {key: rq}})
+
+    # Location filter: drawn shape and/or river-drainage selection, combined per
+    # geo_combine ('and' = ∩, 'or' = ∪).
+    clauses.extend(build_geo_drainage_clauses(
+        getattr(payload, "geo_filter", None),
+        getattr(payload, "drainages", None),
+        getattr(payload, "geo_combine", "and")))
+
+    return clauses
 
 
 def filter_by_geo(hits: list, geo_filter) -> list:
@@ -470,6 +559,78 @@ def get_valid_fish_families() -> set | None:
         return None
 
 
+# Cache of taxon-name -> full synonym group (accepted name + all its synonyms).
+# Keyed by lowercased query name. Each species search hits this once, so an
+# in-process TTL cache keeps repeated searches from re-querying TaxonRank.
+_synonym_group_cache = {}
+_SYNONYM_GROUP_TTL_SECONDS = 3600
+
+
+def resolve_taxon_group(name: str) -> list | None:
+    """Given a species name (as-published or accepted), return EVERY scientific
+    name that shares its accepted taxon concept — the valid name plus all of its
+    synonyms — so a search can find every specimen of the species no matter which
+    name each collection filed it under (Eschmeyer/Catalog-of-Fishes style).
+
+    Returns None (caller falls back to normal search) when: TaxonRank isn't
+    configured, the term doesn't look like a binomial, or no matching taxon is
+    found (e.g. a typo, an institution code, a locality)."""
+    if taxon_engine is None or not name:
+        return None
+    key = name.strip().lower()
+    # Only attempt for things that look like a species binomial (>= 2 alpha
+    # tokens). Single tokens (genus/family/institution) are handled fine by the
+    # normal Genus/Family field search and would only add noise here.
+    tokens = [t for t in key.split() if t]
+    if len(tokens) < 2 or not all(t.replace("-", "").isalpha() for t in tokens):
+        return None
+    now = time.time()
+    cached = _synonym_group_cache.get(key)
+    if cached is not None and now < cached["expires_at"]:
+        return cached["value"]
+    try:
+        with taxon_engine.connect() as conn:
+            # Find the matching taxon; prefer the accepted (valid_id IS NULL) row
+            # if the same string exists as both a valid name and a synonym.
+            row = conn.execute(text(
+                "SELECT id, valid_id FROM taxa "
+                "WHERE lower(scientific_name) = :n AND rank = 'SPECIES' "
+                "ORDER BY (valid_id IS NULL) DESC LIMIT 1"
+            ), {"n": key}).fetchone()
+            if row is None:
+                _synonym_group_cache[key] = {"value": None, "expires_at": now + _SYNONYM_GROUP_TTL_SECONDS}
+                return None
+            tid, valid_id = row
+            root_id = valid_id or tid  # the accepted-concept id
+            rows = conn.execute(text(
+                "SELECT scientific_name FROM taxa WHERE id = :r OR valid_id = :r"
+            ), {"r": root_id}).fetchall()
+        names = sorted({r[0].strip() for r in rows if r[0] and r[0].strip()})
+        value = names or None
+        _synonym_group_cache[key] = {"value": value, "expires_at": now + _SYNONYM_GROUP_TTL_SECONDS}
+        return value
+    except Exception as e:
+        print(f"Warning: taxon synonym resolution failed for {name!r}: {e}")
+        return None
+
+
+def build_synonym_expanded_query(term: str) -> dict | None:
+    """If `term` resolves to a species taxon concept, return an ES query that
+    precisely matches every specimen of that concept — all synonyms + the valid
+    name, via phrase match on ScientificName/ValidName. Phrase match (not the
+    default token-OR multi_match) is what keeps 'Gila robusta' from also pulling
+    in 'Gila atraria' or 'Rosenblattia robusta'. Returns None so callers fall
+    back to their normal term query when the term isn't a resolvable species."""
+    group = resolve_taxon_group(term)
+    if not group:
+        return None
+    should = []
+    for n in group:
+        should.append({"match_phrase": {"ScientificName": n}})
+        should.append({"match_phrase": {"ValidName": n}})
+    return {"bool": {"should": should, "minimum_should_match": 1}}
+
+
 def get_global_fish_species_count() -> int | None:
     """Total number of valid fish species in the TaxonRank reference DB.
 
@@ -639,12 +800,16 @@ def is_quoted_phrase(term: str) -> bool:
     return len(t) >= 2 and t.startswith('"') and t.endswith('"')
 
 
-def build_field_query(field: str, operator: Optional[str], value: str) -> dict:
+def build_field_query(field: str, operator: Optional[str], value: str, _expand: bool = True) -> dict:
     """
     Generate Elasticsearch query based on field and operator.
     - Numeric fields support range queries (>, <, >=, <=, etc.).
     - String fields support exact match, fuzzy match, wildcard, prefix, etc.
     - Enum fields support multi-select.
+    - The taxon-name field is searched across BOTH the as-published name
+      (ScientificName) and the ETL-corrected valid name (ValidName), so users
+      never have to choose between them — searching a name just finds the record
+      whether the collection filed it under the old or the accepted name.
     """
     # If no operator provided, set default based on field type
     if not operator: # none and ''
@@ -658,13 +823,46 @@ def build_field_query(field: str, operator: Optional[str], value: str) -> dict:
         else:
             raise ValueError(f"Unsupported type for field {field} with value {value}")
 
+    # Taxon-name expansion: "ScientificName" matches ScientificName OR ValidName.
+    # _expand=False on the recursive calls prevents infinite recursion.
+    if _expand and field == "ScientificName":
+        name_fields = ("ScientificName", "ValidName")
+        if operator == "!=":
+            # "name is not X" = neither name equals X, among records that have a
+            # name (a bare OR of per-field != would wrongly keep records whose
+            # other name IS X).
+            equals_any = {"bool": {"should": [
+                build_field_query(f, "=", value, _expand=False) for f in name_fields
+            ], "minimum_should_match": 1}}
+            has_name = {"bool": {"should": [
+                {"exists": {"field": f}} for f in name_fields
+            ], "minimum_should_match": 1}}
+            return {"bool": {"must": has_name, "must_not": equals_any}}
+        return {"bool": {"should": [
+            build_field_query(f, operator, value, _expand=False) for f in name_fields
+        ], "minimum_should_match": 1}}
+
+    # Exact-match term clause. Numeric fields (long/float) have no `.keyword`
+    # sub-field, so term-query the field itself. Text fields match `.keyword`
+    # case-insensitively — users don't expect "gila nigra" to miss "Gila nigra"
+    # (case_insensitive is only valid on keyword terms, hence numeric is exact).
+    if field in NUMERIC_FIELDS:
+        exact_term = {"term": {field: value}}
+    else:
+        exact_term = {"term": {f"{field}.keyword": {"value": value, "case_insensitive": True}}}
+
     # Generate corresponding query based on operator
     if operator == "=":
-        # Exact match (using keyword field)
-        return {"term": {f"{field}.keyword": value}}
+        # Exact match
+        return exact_term
     elif operator == "!=":
-        # Exclude match
-        return {"bool": {"must_not": {"term": {f"{field}.keyword": value}}}}
+        # Exclude match, but only among records that HAVE the field —
+        # a bare must_not also returns docs where the field is absent, which
+        # users don't expect ("Country != USA" shouldn't surface no-country records).
+        return {"bool": {
+            "must": {"exists": {"field": field}},
+            "must_not": exact_term,
+        }}
     elif operator in [">", "<", ">=", "<="]:
         # Range query, for numeric types
         range_operators = {
@@ -675,8 +873,11 @@ def build_field_query(field: str, operator: Optional[str], value: str) -> dict:
         }
         return {"range": {field: {range_operators[operator]: value}}}
     elif operator == "contains":
-        # Fuzzy match (tokenized), for string types
-        return {"match": {field: value}}
+        # Tokenized match. operator=and so a multi-word value requires ALL words
+        # ("Gila nigra" no longer also matches every "Gila *" and "* nigra" —
+        # that token-OR flood is the classic contains over-match). Single-word
+        # values are unaffected.
+        return {"match": {field: {"query": value, "operator": "and"}}}
     elif operator == "phrase":
         # Phrase match (exact phrase)
         return {"match_phrase": {field: value}}
@@ -862,13 +1063,13 @@ async def aggregation(payload: Optional[SearchPayload] = None):
             if has_wildcard(payload.term):
                 es_query["query"] = build_wildcard_query(payload.term, WILDCARD_SEARCH_FIELDS)
             else:
-                # Exact match only for aggregation (no fuzzy/phonetic noise)
-                es_query["query"] = {
+                # Prefer the precise taxon-concept query when the term resolves to
+                # a species (all synonyms + valid name), so the facet counts match
+                # /adsearch's results. Otherwise exact multi_match (no fuzzy noise).
+                es_query["query"] = build_synonym_expanded_query(payload.term) or {
                     "multi_match": {
                         "query": payload.term,
-                        "fields": ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
-                                  "InstitutionCode^3", "CollectionCode^3", "CatalogNumber^2",
-                                  "Country", "StateProvince", "County", "Locality^0.5"],
+                        "fields": TERM_QUERY_FIELDS,
                     }
                 }
         elif payload and payload.conditions:
@@ -876,39 +1077,21 @@ async def aggregation(payload: Optional[SearchPayload] = None):
         else:
             es_query["query"] = {"match_all": {}}
 
-        # Constrain the facet buckets by the first-level filters the caller sends
-        # (multi_filters + geo_filter). Without this the facets ignore the current
-        # filters — e.g. after filtering to the Pearl drainage, the Drainage facet
-        # would still list every drainage. Mirrors the /adsearch filter handling.
-        if payload:
-            filter_clauses = []
-            for key, values in (payload.multi_filters or {}).items():
-                if not values:
-                    continue
-                if key == "Country":
-                    filter_clauses.append({"terms": {"CountryCode.keyword": values}})
-                elif key == "StateProvince":
-                    all_variations = []
-                    for v in values:
-                        all_variations.extend(get_all_variations(v, key))
-                    filter_clauses.append({"terms": {f"{key}.keyword": list(set(all_variations))}})
-                else:
-                    filter_clauses.append({"terms": {f"{key}.keyword": values}})
+        # Constrain the facet buckets by the SAME filters the table applies. Built by
+        # the shared build_filter_clauses() so the facet counts always match the
+        # /adsearch result set — including legacy single-select filter_conditions,
+        # which this endpoint previously ignored (the "table 3 / facet 万" bug).
+        filter_clauses = build_filter_clauses(payload) if payload else []
 
-            for key, range_values in (payload.range_filters or {}).items():
-                range_query = {}
-                if range_values.get("min") is not None:
-                    range_query["gte"] = range_values["min"]
-                if range_values.get("max") is not None:
-                    range_query["lte"] = range_values["max"]
-                if range_query:
-                    filter_clauses.append({"range": {key: range_query}})
+        # Nothing entered at all (no term, no conditions, no filter) -> there is no
+        # active search. Return empty facets instead of aggregating the whole index,
+        # so the sidebar doesn't show millions of results next to an empty table.
+        # Mirrors /adsearch, which does not run a bare match_all.
+        if not (payload and (payload.term or payload.conditions)) and not filter_clauses:
+            return EMPTY_AGGREGATION_RESPONSE
 
-            filter_clauses.extend(build_geo_drainage_clauses(
-                payload.geo_filter, payload.drainages, payload.geo_combine))
-
-            if filter_clauses:
-                es_query["query"] = {"bool": {"must": es_query["query"], "filter": filter_clauses}}
+        if filter_clauses:
+            es_query["query"] = {"bool": {"must": es_query["query"], "filter": filter_clauses}}
 
         # Execute query
         # response = es.search(index=settings.ES_INDEX, body=es_query)
@@ -1186,20 +1369,24 @@ async def adsearch(payload: SearchPayload):
                         "multi_match": {
                             "query": phrase,
                             "type": "phrase",
-                            "fields": ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
-                                      "InstitutionCode^3", "CollectionCode^3", "CatalogNumber^2",
-                                      "Country", "StateProvince", "Locality^0.5"],
+                            "fields": TERM_QUERY_FIELDS,
                         }
                     }
                 else:
+                    # Taxon-concept search first: if the term is a known species
+                    # name, match every specimen of that concept (all synonyms +
+                    # valid name) precisely — this both finds every name and avoids
+                    # the token-OR over-matching that pulls in other species
+                    # ("Gila robusta" otherwise also matches "Gila atraria" /
+                    # "Rosenblattia robusta"). Only when the term isn't a resolvable
+                    # species do we fall back to the exact→fuzzy→phonetic cascade.
+                    _expanded = build_synonym_expanded_query(payload.term)
                     # Cascade search: exact → fuzzy → phonetic
                     # Start with exact match only
-                    es_query["query"] = {
+                    es_query["query"] = _expanded if _expanded is not None else {
                         "multi_match": {
                             "query": payload.term,
-                            "fields": ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
-                                      "InstitutionCode^3", "CollectionCode^3", "CatalogNumber^2",
-                                      "Country", "StateProvince", "Locality^0.5"],
+                            "fields": TERM_QUERY_FIELDS,
                         }
                     }
                     # Define escalation tiers for cascade
@@ -1253,6 +1440,11 @@ async def adsearch(payload: SearchPayload):
                             "minimum_should_match": 1
                         }}
                     ]
+                    # A resolved taxon concept is already precise + complete — drop
+                    # the escalation tiers so we don't re-introduce fuzzy noise
+                    # (the escalation site keys off `_cascade_queries` in locals()).
+                    if _expanded is not None:
+                        del _cascade_queries
             elif isinstance(payload.term, (int, float)):
                 fields = numeric_fields
                 es_query["query"] = {
@@ -1274,58 +1466,25 @@ async def adsearch(payload: SearchPayload):
         elif payload.conditions:
             # Advanced search logic
             es_query["query"] = build_es_query(payload.conditions)["query"]
-        else:
-            raise HTTPException(status_code=400, detail="Either 'term' or 'conditions' must be provided.")
 
-        # Execute query with filters (supports legacy single-select, multi-select, and range filters)
-        filter_clauses = []
+        # Sidebar/facet filters (single-select, multi-select, range, geo/drainage).
+        # Built by the shared build_filter_clauses() so the table applies the EXACT
+        # same filters as the facet aggregation (/adaggregation) and the map
+        # (/map_points) — no divergence, no "table 3 / facet 万".
+        filter_clauses = build_filter_clauses(payload)
 
-        # Sidebar 'Country' values are ISO 2-letter codes from the CountryCode
-        # aggregation, so route them to the CountryCode field instead of Country.
-        def _filter_field(key: str) -> str:
-            return "CountryCode.keyword" if key == "Country" else f"{key}.keyword"
-
-        # Legacy single-select filter conditions
-        if filter_conditions:
-            for key, value in filter_conditions.items():
-                if key == "Country":
-                    filter_clauses.append({"term": {_filter_field(key): value}})
-                elif key == "StateProvince":
-                    # State names still need normalization expansion
-                    variations = get_all_variations(value, key)
-                    filter_clauses.append({"terms": {f"{key}.keyword": variations}})
-                else:
-                    filter_clauses.append({"term": {f"{key}.keyword": value}})
-
-        # Multi-select filter conditions
-        multi_filters = payload.multi_filters or {}
-        for key, values in multi_filters.items():
-            if values and len(values) > 0:
-                if key == "Country":
-                    filter_clauses.append({"terms": {_filter_field(key): values}})
-                elif key == "StateProvince":
-                    all_variations = []
-                    for v in values:
-                        all_variations.extend(get_all_variations(v, key))
-                    filter_clauses.append({"terms": {f"{key}.keyword": list(set(all_variations))}})
-                else:
-                    filter_clauses.append({"terms": {f"{key}.keyword": values}})
-
-        # Range filter conditions
-        range_filters = payload.range_filters or {}
-        for key, range_values in range_filters.items():
-            range_query = {}
-            if "min" in range_values and range_values["min"] is not None:
-                range_query["gte"] = range_values["min"]
-            if "max" in range_values and range_values["max"] is not None:
-                range_query["lte"] = range_values["max"]
-            if range_query:
-                filter_clauses.append({"range": {key: range_query}})
-
-        # Location Filter: drawn shape and/or river-drainage selection, combined
-        # per payload.geo_combine ('and' = ∩, 'or' = ∪). Bounding box for the shape.
-        filter_clauses.extend(build_geo_drainage_clauses(
-            payload.geo_filter, payload.drainages, payload.geo_combine))
+        if not payload.term and not payload.conditions:
+            if filter_clauses:
+                # Filter-only browse (e.g. just Country=US in the sidebar, no search
+                # term). /adaggregation answers this with match_all + filters; the
+                # table must too, or it would error next to a millions-count facet.
+                es_query["query"] = {"match_all": {}}
+            else:
+                # Nothing entered at all — no active search. Return a clean empty
+                # result (match_none => 0 rows, zeroed stats, empty aggregations)
+                # rather than erroring or aggregating the whole index. This mirrors
+                # /adaggregation's empty-facet response: empty in, empty out.
+                es_query["query"] = {"match_none": {}}
 
         # Cascade search: escalate query if exact results too few
         if '_cascade_queries' in locals():
@@ -1603,9 +1762,7 @@ async def map_points(payload: MapPointsPayload):
     try:
         # Base query — same shape as /adsearch, minus the fuzzy/phonetic cascade
         # (the map should plot exactly what matches, not a widened fallback set).
-        term_fields = ["ScientificName^3", "ValidName^3", "Genus^2", "Family^2",
-                       "InstitutionCode^3", "CollectionCode^3", "CatalogNumber^2",
-                       "Country", "StateProvince", "Locality^0.5"]
+        term_fields = TERM_QUERY_FIELDS
         if payload.conditions:
             base_query = build_es_query(payload.conditions)["query"]
         elif payload.term:
@@ -1615,45 +1772,18 @@ async def map_points(payload: MapPointsPayload):
                 phrase = payload.term.strip().strip('"')
                 base_query = {"multi_match": {"query": phrase, "type": "phrase", "fields": term_fields}}
             else:
-                base_query = {"multi_match": {"query": payload.term, "fields": term_fields}}
+                # Precise taxon-concept query when the term resolves to a species,
+                # so the plotted points match /adsearch + /adaggregation.
+                base_query = build_synonym_expanded_query(payload.term) or \
+                    {"multi_match": {"query": payload.term, "fields": term_fields}}
         else:
             base_query = {"match_all": {}}
 
         # Filters — mirror /adsearch (Country routes to CountryCode; StateProvince expands)
-        filter_clauses = []
-
-        def _filter_field(key: str) -> str:
-            return "CountryCode.keyword" if key == "Country" else f"{key}.keyword"
-
-        for key, value in (payload.filter_conditions or {}).items():
-            if key == "StateProvince":
-                filter_clauses.append({"terms": {f"{key}.keyword": get_all_variations(value, key)}})
-            else:
-                filter_clauses.append({"term": {_filter_field(key): value}})
-
-        for key, values in (payload.multi_filters or {}).items():
-            if values:
-                if key == "StateProvince":
-                    variations = []
-                    for v in values:
-                        variations.extend(get_all_variations(v, key))
-                    filter_clauses.append({"terms": {f"{key}.keyword": list(set(variations))}})
-                else:
-                    filter_clauses.append({"terms": {_filter_field(key): values}})
-
-        for key, rv in (payload.range_filters or {}).items():
-            rq = {}
-            if rv.get("min") is not None:
-                rq["gte"] = rv["min"]
-            if rv.get("max") is not None:
-                rq["lte"] = rv["max"]
-            if rq:
-                filter_clauses.append({"range": {key: rq}})
-
-        # Location Filter (drawn shape and/or drainages, combined per geo_combine)
-        # so the map points match the table.
-        filter_clauses.extend(build_geo_drainage_clauses(
-            payload.geo_filter, payload.drainages, payload.geo_combine))
+        # Sidebar/facet filters via the shared builder so the map markers match the
+        # table rows and facet counts exactly (single-select, multi-select, range,
+        # geo/drainage).
+        filter_clauses = build_filter_clauses(payload)
 
         # Require coordinates, and restrict to the viewport bbox if provided
         filter_clauses.append({"exists": {"field": "Latitude"}})
